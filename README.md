@@ -13,8 +13,11 @@ MiniClaw/
 │   ├── __init__.py
 │   ├── agent.py
 │   ├── cli.py
+│   ├── history.py
 │   ├── llm.py
 │   └── tools.py
+├── tools_plugins/
+│   └── example.py
 ├── workspace/
 │   ├── .gitkeep
 │   └── hello.txt
@@ -26,10 +29,12 @@ MiniClaw/
 各文件职责如下：
 
 - `main.py`：程序入口，只负责调用 `miniclaw.cli.main()`。
-- `miniclaw/cli.py`：命令行交互层，读取用户输入，初始化大模型客户端和 Agent，并处理 `/quit`、`/model` 指令。
+- `miniclaw/cli.py`：命令行交互层，读取用户输入，初始化大模型客户端和 Agent，并处理 `/quit`、`/model`、`/clear` 指令。
 - `miniclaw/agent.py`：智能体核心，维护对话历史，执行模型调用、工具调用和 Observation 回传循环。
+- `miniclaw/history.py`：对话历史持久化，负责加载、保存和清空 `workspace/history.json`。
 - `miniclaw/llm.py`：DeepSeek API 客户端，负责配置读取、OpenAI SDK 调用、响应解析和错误封装。
-- `miniclaw/tools.py`：工具系统，包含工具注册表、工具 schema、工具执行入口，以及三个默认本地文件工具。
+- `miniclaw/tools.py`：工具系统，包含工具注册表、工具 schema、工具执行入口、装饰器插件加载，以及三个默认本地文件工具。
+- `tools_plugins/`：装饰器工具插件目录，新增工具文件后会在启动时自动注册。
 - `workspace/`：工具允许访问的安全工作区。Agent 的读写操作被限制在这个目录内。
 
 ## 核心能力
@@ -70,7 +75,9 @@ CLI 支持两个模型：
 
 `MiniClawAgent` 内部维护 `messages` 列表，初始化时放入 system prompt，之后每轮用户输入、模型回复和工具 Observation 都会追加进去。
 
-这使得同一次程序运行期间，模型可以利用之前的上下文继续对话。不过当前上下文只保存在内存中，程序退出后不会持久化。
+对话历史会自动保存到 `workspace/history.json`。下次启动时，如果该文件存在，CLI 会自动加载历史消息继续对话。
+
+使用 `/clear` 可以清空当前内存中的对话历史，并删除本地历史文件。
 
 ### 3. Function Calling 工具调用
 
@@ -86,6 +93,31 @@ CLI 支持两个模型：
 - `write_text_file(relative_path, content)`：向 `workspace/` 下写入 UTF-8 文本文件，并自动创建父目录。
 
 工具执行结果统一序列化为 JSON 字符串，包含 `ok`、`tool` 和具体返回内容或错误信息，便于模型继续理解执行结果。
+
+项目支持装饰器式工具插件。只需要在 `tools_plugins/*.py` 中新增函数并使用 `@tool(...)` 标注，启动时会自动注册：
+
+```python
+from miniclaw.tools import tool
+
+
+@tool(
+    name="echo_text",
+    description="返回用户传入的一段文本。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "要原样返回的文本。",
+            }
+        },
+    },
+)
+def echo_text(text: str) -> dict[str, str]:
+    return {"text": text}
+```
+
+插件工具同样使用 DeepSeek strict mode。工具 schema 会自动补充 `strict=true`、`additionalProperties=false`，并把所有 properties 写入 required。
 
 ### 4. ReAct 式消息循环
 
@@ -153,6 +185,12 @@ python main.py
 
 输入 `/quit` 退出。普通 `quit` 会作为用户消息发送给模型。
 
+历史指令：
+
+```text
+/clear
+```
+
 模型指令：
 
 ```text
@@ -168,7 +206,9 @@ python main.py
 /model deepseek-reasoner
 列出 workspace 里的文件
 创建 hello.txt，写入“你好，MiniClaw”，然后读取确认内容
+调用 echo_text 工具返回 hello plugin
 尝试读取 ../OpenClaw 个人 Mini 实现-作业2.docx
+/clear
 /quit
 ```
 
@@ -194,21 +234,17 @@ python -m compileall main.py miniclaw
 
 ## 当前限制
 
-- 对话历史没有持久化，程序退出后上下文会丢失。
 - 工具数量较少，目前只覆盖基础文件列表、读取和写入。
 - ReAct 过程只打印 Observation，没有更细粒度地展示模型思考、行动和最终结论的结构化过程。
 - 缺少自动化单元测试，目前主要依赖 `compileall` 做静态编译检查。
-- 没有配置文件或插件机制，新增工具仍需要修改代码。
 - 未实现 shell 执行工具，因此无法完成更复杂的本地自动化任务。
 
 ## 后续扩展建议
 
-1. 增加对话历史持久化，将 `messages` 保存到 JSON 文件，下次启动时可以恢复上下文。
-2. 引入工具插件化机制，例如通过装饰器或配置文件注册工具，降低扩展成本。
-3. 增加单元测试，重点覆盖路径安全检查、工具参数错误、文件读写和模型响应解析。
-4. 增加更清晰的 ReAct 日志展示，将每轮工具调用、Observation 和最终回答分层输出。
-5. 在安全白名单基础上实现有限的 shell 工具，支持更多真实系统操作。
-6. 把 LLM 客户端抽象成通用接口，未来可以切换 DeepSeek、OpenAI、Claude 或本地模型。
+1. 增加单元测试，重点覆盖路径安全检查、工具参数错误、文件读写、历史持久化和插件加载。
+2. 增加更清晰的 ReAct 日志展示，将每轮工具调用、Observation 和最终回答分层输出。
+3. 在安全白名单基础上实现有限的 shell 工具，支持更多真实系统操作。
+4. 把 LLM 客户端抽象成通用接口，未来可以切换 DeepSeek、OpenAI、Claude 或本地模型。
 
 ## 总结
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .agent import MiniClawAgent
+from .history import clear_history, load_history
 from .llm import ConfigError, DeepSeekClient
 from .tools import create_default_registry
 
@@ -10,7 +11,7 @@ MODELS = ("deepseek-chat", "deepseek-reasoner")
 
 def main() -> None:
     print("MiniClaw - Python 智能体作业 2")
-    print("输入 /quit 退出，输入 /model 查看或切换模型。\n")
+    print("输入 /quit 退出，输入 /model 查看或切换模型，输入 /clear 清空历史。\n")
 
     try:
         client = DeepSeekClient.from_env()
@@ -18,7 +19,12 @@ def main() -> None:
         print(f"配置错误：{exc}")
         return
 
-    agent = MiniClawAgent(client=client, tools=create_default_registry())
+    history = load_history()
+    if history:
+        agent = MiniClawAgent(client=client, tools=create_default_registry(), messages=history)
+        print(f"已加载历史对话：{len(history)} 条消息。\n")
+    else:
+        agent = MiniClawAgent(client=client, tools=create_default_registry())
 
     while True:
         try:
@@ -32,6 +38,11 @@ def main() -> None:
         if user_input == "/quit":
             print("再见。")
             return
+        if user_input == "/clear":
+            agent.reset_messages()
+            clear_history()
+            print("已清空对话历史。\n")
+            continue
         if user_input == "/model" or user_input.startswith("/model "):
             _handle_model_command(client, user_input)
             continue

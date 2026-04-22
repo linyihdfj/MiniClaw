@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -8,8 +10,11 @@ from typing import Any, Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
+PLUGINS_DIR = PROJECT_ROOT / "tools_plugins"
 
 ToolFunction = Callable[..., dict[str, Any]]
+_PLUGIN_TOOLS: list["Tool"] = []
+_LOADED_PLUGIN_FILES: set[Path] = set()
 
 
 class ToolError(Exception):
@@ -29,7 +34,7 @@ class Tool:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": _strict_parameters(self.parameters),
                 "strict": True,
             },
         }
@@ -123,7 +128,46 @@ def create_default_registry() -> ToolRegistry:
             function=write_text_file,
         )
     )
+    load_plugins(registry)
     return registry
+
+
+def tool(
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+) -> Callable[[ToolFunction], ToolFunction]:
+    def decorator(function: ToolFunction) -> ToolFunction:
+        _PLUGIN_TOOLS.append(
+            Tool(
+                name=name,
+                description=description,
+                parameters=parameters,
+                function=function,
+            )
+        )
+        return function
+
+    return decorator
+
+
+def load_plugins(registry: ToolRegistry, plugins_dir: Path = PLUGINS_DIR) -> None:
+    if not plugins_dir.is_dir():
+        return
+
+    for plugin_path in sorted(plugins_dir.glob("*.py")):
+        if plugin_path.name == "__init__.py" or plugin_path in _LOADED_PLUGIN_FILES:
+            continue
+
+        module_name = f"miniclaw_plugin_{plugin_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        _LOADED_PLUGIN_FILES.add(plugin_path)
+
+    for plugin_tool in _PLUGIN_TOOLS:
+        registry.register(plugin_tool)
 
 
 def list_files(relative_dir: str = ".") -> dict[str, Any]:
@@ -193,3 +237,11 @@ def _safe_workspace_path(relative_path: str) -> Path:
 
 def _json_result(ok: bool, tool: str, **payload: Any) -> str:
     return json.dumps({"ok": ok, "tool": tool, **payload}, ensure_ascii=False)
+
+
+def _strict_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    strict = dict(parameters)
+    properties = strict.get("properties", {})
+    strict["additionalProperties"] = False
+    strict["required"] = list(properties)
+    return strict
