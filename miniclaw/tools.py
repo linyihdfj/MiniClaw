@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ PLUGINS_DIR = PROJECT_ROOT / "tools_plugins"
 ToolFunction = Callable[..., dict[str, Any]]
 _PLUGIN_TOOLS: list["Tool"] = []
 _LOADED_PLUGIN_FILES: set[Path] = set()
+_SHELL_COMMANDS = {"pwd", "ls", "cat", "head", "tail", "wc", "rg"}
+_SHELL_META_CHARS = {"|", "&", ";", "<", ">", "`", "$", "(", ")", "{", "}"}
+_MAX_SHELL_OUTPUT = 4000
 
 
 class ToolError(Exception):
@@ -66,10 +70,25 @@ class ToolRegistry:
             return _json_result(ok=False, tool=name, error=f"工具执行异常：{exc}")
 
 
-def create_default_registry() -> ToolRegistry:
+def create_default_registry(client: Any | None = None) -> ToolRegistry:
     WORKSPACE_DIR.mkdir(exist_ok=True)
 
     registry = ToolRegistry()
+    register_file_tools(registry, writable=True)
+    register_shell_tool(registry)
+    if client is not None:
+        register_delegate_tool(registry, client)
+    load_plugins(registry)
+    return registry
+
+
+def create_read_only_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    register_file_tools(registry, writable=False)
+    return registry
+
+
+def register_file_tools(registry: ToolRegistry, writable: bool = True) -> None:
     registry.register(
         Tool(
             name="list_files",
@@ -106,30 +125,80 @@ def create_default_registry() -> ToolRegistry:
             function=read_text_file,
         )
     )
+    if writable:
+        registry.register(
+            Tool(
+                name="write_text_file",
+                description="向 workspace 安全目录内写入 UTF-8 文本文件，会自动创建父目录。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {
+                            "type": "string",
+                            "description": "workspace 内要写入的相对文件路径。",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "要写入文件的文本内容。",
+                        },
+                    },
+                    "required": ["relative_path", "content"],
+                    "additionalProperties": False,
+                },
+                function=write_text_file,
+            )
+        )
+
+
+def register_shell_tool(registry: ToolRegistry) -> None:
     registry.register(
         Tool(
-            name="write_text_file",
-            description="向 workspace 安全目录内写入 UTF-8 文本文件，会自动创建父目录。",
+            name="run_shell_command",
+            description="在 workspace 内安全执行只读 shell 命令。只允许 pwd、ls、cat、head、tail、wc、rg。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "允许的命令：pwd、ls、cat、head、tail、wc、rg。",
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "命令参数。无参数时使用空数组。",
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "workspace 内的工作目录；默认意图请传 .。",
+                    },
+                },
+            },
+            function=run_shell_command,
+        )
+    )
+
+
+def register_delegate_tool(registry: ToolRegistry, client: Any) -> None:
+    registry.register(
+        Tool(
+            name="delegate_file_analysis",
+            description="将 workspace 文件分析任务委托给只读分析子 Agent。",
             parameters={
                 "type": "object",
                 "properties": {
                     "relative_path": {
                         "type": "string",
-                        "description": "workspace 内要写入的相对文件路径。",
+                        "description": "workspace 内要分析的文件路径。",
                     },
-                    "content": {
+                    "task": {
                         "type": "string",
-                        "description": "要写入文件的文本内容。",
+                        "description": "希望分析子 Agent 完成的具体分析任务。",
                     },
                 },
-                "required": ["relative_path", "content"],
-                "additionalProperties": False,
             },
-            function=write_text_file,
+            function=_make_delegate_file_analysis(client),
         )
     )
-    load_plugins(registry)
-    return registry
 
 
 def tool(
@@ -220,6 +289,38 @@ def write_text_file(relative_path: str, content: str) -> dict[str, Any]:
     }
 
 
+def run_shell_command(
+    command: str,
+    args: list[str],
+    working_dir: str,
+) -> dict[str, Any]:
+    command_args = _validate_shell_command(command, args)
+    cwd = _safe_workspace_path(working_dir)
+    if not cwd.is_dir():
+        raise ToolError(f"工作目录不存在或不是目录：{working_dir}")
+
+    completed = subprocess.run(
+        [command, *command_args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        shell=False,
+        check=False,
+    )
+
+    stdout = _truncate(completed.stdout)
+    stderr = _truncate(completed.stderr)
+    return {
+        "command": command,
+        "args": command_args,
+        "working_dir": working_dir,
+        "returncode": completed.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
 def _safe_workspace_path(relative_path: str) -> Path:
     candidate = Path(relative_path)
     if candidate.is_absolute():
@@ -233,6 +334,142 @@ def _safe_workspace_path(relative_path: str) -> Path:
         raise ToolError("安全限制：路径必须位于 workspace 目录内。")
 
     return resolved
+
+
+def _make_delegate_file_analysis(client: Any) -> ToolFunction:
+    def delegate_file_analysis(relative_path: str, task: str) -> dict[str, Any]:
+        from .subagents import AnalysisSubAgent
+
+        analysis = AnalysisSubAgent(client).analyze(relative_path=relative_path, task=task)
+        return {
+            "relative_path": relative_path,
+            "task": task,
+            "analysis": analysis,
+        }
+
+    return delegate_file_analysis
+
+
+def _validate_shell_command(command: str, args: list[str]) -> list[str]:
+    _reject_shell_syntax(command)
+    if command not in _SHELL_COMMANDS:
+        raise ToolError(f"不允许执行命令：{command}")
+    if not isinstance(args, list):
+        raise ToolError("args 必须是字符串数组。")
+
+    for arg in args:
+        _reject_shell_syntax(arg)
+
+    validators = {
+        "pwd": _validate_pwd_args,
+        "ls": _validate_ls_args,
+        "cat": _validate_cat_args,
+        "head": _validate_head_tail_args,
+        "tail": _validate_head_tail_args,
+        "wc": _validate_wc_args,
+        "rg": _validate_rg_args,
+    }
+    return validators[command](args)
+
+
+def _reject_shell_syntax(value: str) -> None:
+    if "\n" in value or "\x00" in value:
+        raise ToolError("shell 参数不允许包含换行或 NUL 字符。")
+    if any(char in value for char in _SHELL_META_CHARS):
+        raise ToolError(f"shell 参数包含不允许的语法字符：{value}")
+
+
+def _validate_pwd_args(args: list[str]) -> list[str]:
+    if args:
+        raise ToolError("pwd 不允许携带参数。")
+    return []
+
+
+def _validate_ls_args(args: list[str]) -> list[str]:
+    allowed_flags = {"-l", "-a", "-la", "-al"}
+    return _validate_flags_and_paths(args, allowed_flags, allow_directory=True)
+
+
+def _validate_cat_args(args: list[str]) -> list[str]:
+    if not args:
+        raise ToolError("cat 需要至少一个 workspace 内文件路径。")
+    return [_validate_file_arg(arg) for arg in args]
+
+
+def _validate_head_tail_args(args: list[str]) -> list[str]:
+    result: list[str] = []
+    index = 0
+    if len(args) >= 2 and args[0] == "-n":
+        if not args[1].isdigit():
+            raise ToolError("-n 后必须是数字。")
+        result.extend(args[:2])
+        index = 2
+
+    paths = args[index:]
+    if not paths:
+        raise ToolError("head/tail 需要至少一个 workspace 内文件路径。")
+    result.extend(_validate_file_arg(path) for path in paths)
+    return result
+
+
+def _validate_wc_args(args: list[str]) -> list[str]:
+    allowed_flags = {"-l", "-w", "-c"}
+    return _validate_flags_and_paths(args, allowed_flags, allow_directory=False)
+
+
+def _validate_rg_args(args: list[str]) -> list[str]:
+    flags: list[str] = []
+    rest = list(args)
+    while rest and rest[0] in {"-n", "-i"}:
+        flags.append(rest.pop(0))
+
+    if not rest:
+        raise ToolError("rg 需要搜索 pattern。")
+
+    pattern = rest.pop(0)
+    if rest:
+        if len(rest) > 1:
+            raise ToolError("rg 只允许一个可选搜索目录。")
+        return [*flags, pattern, _validate_dir_arg(rest[0])]
+
+    return [*flags, pattern]
+
+
+def _validate_flags_and_paths(
+    args: list[str],
+    allowed_flags: set[str],
+    allow_directory: bool,
+) -> list[str]:
+    result: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            if arg not in allowed_flags:
+                raise ToolError(f"不允许的参数：{arg}")
+            result.append(arg)
+            continue
+
+        result.append(_validate_dir_arg(arg) if allow_directory else _validate_file_arg(arg))
+    return result
+
+
+def _validate_file_arg(arg: str) -> str:
+    path = _safe_workspace_path(arg)
+    if not path.is_file():
+        raise ToolError(f"不是 workspace 内文件：{arg}")
+    return arg
+
+
+def _validate_dir_arg(arg: str) -> str:
+    path = _safe_workspace_path(arg)
+    if not path.is_dir():
+        raise ToolError(f"不是 workspace 内目录：{arg}")
+    return arg
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_SHELL_OUTPUT:
+        return text
+    return text[:_MAX_SHELL_OUTPUT] + "\n...[truncated]"
 
 
 def _json_result(ok: bool, tool: str, **payload: Any) -> str:

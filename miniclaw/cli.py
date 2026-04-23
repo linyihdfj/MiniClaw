@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .agent import MiniClawAgent
 from .history import clear_history, load_history
 from .llm import ConfigError, DeepSeekClient
@@ -21,10 +23,14 @@ def main() -> None:
 
     history = load_history()
     if history:
-        agent = MiniClawAgent(client=client, tools=create_default_registry(), messages=history)
+        agent = MiniClawAgent(
+            client=client,
+            tools=create_default_registry(client=client),
+            messages=history,
+        )
         print(f"已加载历史对话：{len(history)} 条消息。\n")
     else:
-        agent = MiniClawAgent(client=client, tools=create_default_registry())
+        agent = MiniClawAgent(client=client, tools=create_default_registry(client=client))
 
     while True:
         try:
@@ -71,6 +77,7 @@ def main() -> None:
             user_input,
             on_content_delta=print_content,
             on_reasoning_delta=print_reasoning,
+            on_trace=_print_trace,
         )
         if answer:
             if not printed_content:
@@ -97,3 +104,18 @@ def _handle_model_command(client: DeepSeekClient, command: str) -> None:
 
     client.model = model
     print(f"已切换模型：{client.model}\n")
+
+
+def _print_trace(event: dict) -> None:
+    step = event["step"]
+    event_type = event["type"]
+    if event_type == "thought":
+        print(f"\n[Step {step} Thought]")
+        print(event["content"])
+    elif event_type == "action":
+        print(f"\n[Step {step} Action]")
+        arguments = json.dumps(event["arguments"], ensure_ascii=False)
+        print(f"{event['tool']}({arguments})")
+    elif event_type == "observation":
+        print(f"\n[Step {step} Observation]")
+        print(event["content"])

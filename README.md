@@ -15,6 +15,7 @@ MiniClaw/
 │   ├── cli.py
 │   ├── history.py
 │   ├── llm.py
+│   ├── subagents.py
 │   └── tools.py
 ├── tools_plugins/
 │   └── example.py
@@ -33,7 +34,8 @@ MiniClaw/
 - `miniclaw/agent.py`：智能体核心，维护对话历史，执行模型调用、工具调用和 Observation 回传循环。
 - `miniclaw/history.py`：对话历史持久化，负责加载、保存和清空 `workspace/history.json`。
 - `miniclaw/llm.py`：DeepSeek API 客户端，负责配置读取、OpenAI SDK 调用、响应解析和错误封装。
-- `miniclaw/tools.py`：工具系统，包含工具注册表、工具 schema、工具执行入口、装饰器插件加载，以及三个默认本地文件工具。
+- `miniclaw/subagents.py`：分析子 Agent，用于承接主 Agent 委托的只读文件分析任务。
+- `miniclaw/tools.py`：工具系统，包含工具注册表、工具 schema、工具执行入口、装饰器插件加载、安全 shell 工具，以及默认本地工具。
 - `tools_plugins/`：装饰器工具插件目录，新增工具文件后会在启动时自动注册。
 - `workspace/`：工具允许访问的安全工作区。Agent 的读写操作被限制在这个目录内。
 
@@ -86,11 +88,13 @@ CLI 支持两个模型：
 - `Tool` 保存工具名称、描述、JSON Schema 参数定义和实际 Python 函数。
 - `ToolRegistry` 负责注册工具、导出模型可见的工具 schema，并根据模型返回的工具名和参数执行对应函数。
 
-当前内置三个工具：
+当前内置工具包括：
 
 - `list_files(relative_dir)`：列出 `workspace/` 下某个相对目录的直接子文件和子目录；列根目录时传 `"."`。
 - `read_text_file(relative_path)`：读取 `workspace/` 下的 UTF-8 文本文件。
 - `write_text_file(relative_path, content)`：向 `workspace/` 下写入 UTF-8 文本文件，并自动创建父目录。
+- `run_shell_command(command, args, working_dir)`：在 `workspace/` 内执行安全的只读 shell 命令。
+- `delegate_file_analysis(relative_path, task)`：把文件分析任务委托给只读分析子 Agent。
 
 工具执行结果统一序列化为 JSON 字符串，包含 `ok`、`tool` 和具体返回内容或错误信息，便于模型继续理解执行结果。
 
@@ -119,6 +123,10 @@ def echo_text(text: str) -> dict[str, str]:
 
 插件工具同样使用 DeepSeek strict mode。工具 schema 会自动补充 `strict=true`、`additionalProperties=false`，并把所有 properties 写入 required。
 
+`run_shell_command` 只允许 `pwd`、`ls`、`cat`、`head`、`tail`、`wc`、`rg`，并拒绝管道、重定向、命令连接符、越界路径和非白名单参数。命令通过 `subprocess.run(..., shell=False)` 执行，工作目录和文件参数都必须位于 `workspace/` 内。
+
+`delegate_file_analysis` 会创建一个短期分析子 Agent。子 Agent 使用同一个 DeepSeek 客户端，但只拥有 `list_files` 和 `read_text_file` 两个只读工具，也不会写入主对话历史。
+
 ### 4. ReAct 式消息循环
 
 `agent.py` 中的 `run_turn()` 是整个项目的核心流程：
@@ -141,6 +149,8 @@ def echo_text(text: str) -> dict[str, str]:
 - Observation：本地工具执行结果回传给模型。
 - Final Answer：模型基于 Observation 给出最终回复。
 
+控制台会按轮次展示 `[Step N Thought]`、`[Step N Action]`、`[Step N Observation]`。其中 Thought 优先展示 `deepseek-reasoner` 返回的 `reasoning_content`；没有公开 reasoning 时，会显示简短的工具调用摘要。
+
 项目设置了 `max_steps=6`，避免模型持续调用工具导致无限循环。
 
 ### 5. 本地执行安全隔离
@@ -152,6 +162,8 @@ def echo_text(text: str) -> dict[str, str]:
 - 解析后不位于 `workspace/` 目录内的路径。
 
 因此，即使用户要求读取项目根目录下的作业文档或其他文件，工具也会拒绝越界访问。这一点符合“本地执行与安全隔离”的作业要求。
+
+shell 工具额外使用命令白名单和参数校验，只支持只读命令，不允许写文件、联网、环境变量展开、管道或重定向。
 
 ## 运行方式
 
@@ -207,6 +219,8 @@ python main.py
 列出 workspace 里的文件
 创建 hello.txt，写入“你好，MiniClaw”，然后读取确认内容
 调用 echo_text 工具返回 hello plugin
+用 shell 列出 workspace 根目录
+分析 workspace/hello.txt 的主要内容
 尝试读取 ../OpenClaw 个人 Mini 实现-作业2.docx
 /clear
 /quit
@@ -219,10 +233,10 @@ python main.py
 可以使用下面的命令检查 Python 文件是否能正常编译：
 
 ```powershell
-python -m compileall main.py miniclaw
+python -m compileall main.py miniclaw tools_plugins
 ```
 
-当前检查结果：`main.py` 和 `miniclaw/` 均可通过编译。
+当前检查结果：`main.py`、`miniclaw/` 和 `tools_plugins/` 均可通过编译。
 
 ## 项目优点
 
@@ -234,16 +248,15 @@ python -m compileall main.py miniclaw
 
 ## 当前限制
 
-- 工具数量较少，目前只覆盖基础文件列表、读取和写入。
-- ReAct 过程只打印 Observation，没有更细粒度地展示模型思考、行动和最终结论的结构化过程。
 - 缺少自动化单元测试，目前主要依赖 `compileall` 做静态编译检查。
-- 未实现 shell 执行工具，因此无法完成更复杂的本地自动化任务。
+- shell 工具目前只支持只读白名单命令，不能执行写入、联网或复杂管道任务。
+- 多 Agent 协作仍是雏形，目前只有主 Agent 委托文件分析子 Agent。
 
 ## 后续扩展建议
 
-1. 增加单元测试，重点覆盖路径安全检查、工具参数错误、文件读写、历史持久化和插件加载。
-2. 增加更清晰的 ReAct 日志展示，将每轮工具调用、Observation 和最终回答分层输出。
-3. 在安全白名单基础上实现有限的 shell 工具，支持更多真实系统操作。
+1. 增加单元测试，重点覆盖路径安全检查、shell 白名单、工具参数错误、历史持久化和插件加载。
+2. 扩展多 Agent 协作，例如增加代码审查子 Agent、测试子 Agent 或任务路由器。
+3. 在安全白名单基础上扩展更多只读 shell 能力。
 4. 把 LLM 客户端抽象成通用接口，未来可以切换 DeepSeek、OpenAI、Claude 或本地模型。
 
 ## 总结
