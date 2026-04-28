@@ -84,6 +84,7 @@ class DeepSeekClient:
         tool_choice: str = "auto",
         on_content_delta: Callable[[str], None] | None = None,
         on_reasoning_delta: Callable[[str], None] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         response = self.client.chat.completions.create(
             model=self.model,
@@ -123,6 +124,19 @@ class DeepSeekClient:
                     tool_call["function"]["name"] = tool_call_delta.function.name
                 if tool_call_delta.function.arguments:
                     tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+
+                if on_tool_call_delta:
+                    on_tool_call_delta(
+                        {
+                            "index": index,
+                            "id": tool_call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tool_call["function"]["name"],
+                                "arguments": tool_call["function"]["arguments"],
+                            },
+                        }
+                    )
 
         content = "".join(content_parts)
         message: dict[str, Any] = {

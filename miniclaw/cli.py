@@ -116,6 +116,10 @@ def _print_trace(event: dict) -> None:
         print(f"\n[Step {step} Action]")
         arguments = json.dumps(event["arguments"], ensure_ascii=False)
         print(f"{event['tool']}({arguments})")
-    elif event_type == "observation":
+    elif event_type == "observation_start":
         print(f"\n[Step {step} Observation]")
+        print(event.get("content") or "开始执行工具。")
+    elif event_type == "observation_delta":
+        print(event.get("content") or "")
+    elif event_type == "observation":
         print(event["content"])

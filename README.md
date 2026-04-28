@@ -92,7 +92,15 @@ CLI 支持两个模型：
 
 - `list_files(relative_dir)`：列出 `workspace/` 下某个相对目录的直接子文件和子目录；列根目录时传 `"."`。
 - `read_text_file(relative_path)`：读取 `workspace/` 下的 UTF-8 文本文件。
+- `list_directory_tree(relative_dir, max_depth)`：递归列出 `workspace/` 下的目录树，适合快速了解结构。
+- `search_files(pattern, relative_dir, case_sensitive, max_matches)`：在 `workspace/` 下搜索 UTF-8 文件内容，返回匹配行。
 - `write_text_file(relative_path, content)`：向 `workspace/` 下写入 UTF-8 文本文件，并自动创建父目录。
+- `append_text_file(relative_path, content)`：向 `workspace/` 下的文本文件追加内容，不存在则创建。
+- `replace_text_in_file(relative_path, old_text, new_text, count)`：在 `workspace/` 下的文本文件中替换指定文本。
+- `search_web(query, max_results, site)`：使用 Bing、Baidu、Google 联网搜索公开网页信息，支持返回数量和站点限定，并对结果去重。
+- `fetch_web_page(url, max_chars)`：打开公开网页 URL，提取标题、正文文本和链接摘要。
+- `get_current_time(timezone)`：获取指定 IANA 时区的当前日期和时间。
+- `calculate_expression(expression)`：安全计算数学表达式，支持常见 `math` 函数。
 - `run_shell_command(command, args, working_dir)`：在 `workspace/` 内执行安全的只读 shell 命令。
 - `delegate_file_analysis(relative_path, task)`：把文件分析任务委托给只读分析子 Agent。
 
@@ -149,7 +157,7 @@ def echo_text(text: str) -> dict[str, str]:
 - Observation：本地工具执行结果回传给模型。
 - Final Answer：模型基于 Observation 给出最终回复。
 
-控制台会按轮次展示 `[Step N Thought]`、`[Step N Action]`、`[Step N Observation]`。其中 Thought 优先展示 `deepseek-reasoner` 返回的 `reasoning_content`；没有公开 reasoning 时，会显示简短的工具调用摘要。
+控制台会按轮次展示 `[Step N Thought]`、`[Step N Action]`、`[Step N Observation]`。其中 Thought 优先展示 `deepseek-reasoner` 返回的 `reasoning_content`；Observation 支持工具执行过程中的增量输出，最终仍会展示完整工具 JSON。
 
 项目设置了 `max_steps=6`，避免模型持续调用工具导致无限循环。
 
@@ -163,7 +171,7 @@ def echo_text(text: str) -> dict[str, str]:
 
 因此，即使用户要求读取项目根目录下的作业文档或其他文件，工具也会拒绝越界访问。这一点符合“本地执行与安全隔离”的作业要求。
 
-shell 工具额外使用命令白名单和参数校验，只支持只读命令，不允许写文件、联网、环境变量展开、管道或重定向。
+shell 工具额外使用命令白名单和参数校验，只支持只读命令，不允许写文件、环境变量展开、管道或重定向。需要联网时应使用 `search_web`，而不是通过 shell 绕过限制。
 
 ## 运行方式
 
@@ -218,7 +226,12 @@ python main.py
 /model deepseek-reasoner
 列出 workspace 里的文件
 创建 hello.txt，写入“你好，MiniClaw”，然后读取确认内容
+在 workspace 中搜索 main 函数
+把 hello.txt 末尾追加一行“继续扩展工具”
 调用 echo_text 工具返回 hello plugin
+搜索 OpenAI API 最新文档，并打开一条结果核验正文
+计算 sin(pi / 2) + 2^8
+告诉我 Asia/Shanghai 当前时间
 用 shell 列出 workspace 根目录
 分析 workspace/hello.txt 的主要内容
 尝试读取 ../OpenClaw 个人 Mini 实现-作业2.docx
@@ -258,6 +271,72 @@ python -m compileall main.py miniclaw tools_plugins
 2. 扩展多 Agent 协作，例如增加代码审查子 Agent、测试子 Agent 或任务路由器。
 3. 在安全白名单基础上扩展更多只读 shell 能力。
 4. 把 LLM 客户端抽象成通用接口，未来可以切换 DeepSeek、OpenAI、Claude 或本地模型。
+
+## Web 前端模式（新增）
+
+项目新增了基于 FastAPI + SSE 的前端模式，提供：
+
+- Markdown 渲染：支持 GFM（标题、列表、表格、代码块等）。
+- 代码高亮：前端使用 highlight.js 渲染代码块。
+- 数学公式：支持 $inline$ 与 $$block$$ 公式渲染（KaTeX）。
+- 单框时间线展示：在同一个 assistant 气泡内按时间顺序展示 Thought / Action / Observation / Final Answer。
+
+启动方式：
+
+```powershell
+pip install -r requirements.txt
+python main.py web
+```
+
+默认会启动在：
+
+```text
+http://127.0.0.1:8000
+```
+
+说明：
+
+- Web 模式与 CLI 模式并存。
+- `python main.py` 仍然是原有 CLI 交互模式。
+- TAO 事件由后端按步骤推送；Action 和 Observation 都会在同一个 assistant 消息时间线中增量更新，工具完成后再显示完整 Observation JSON。
+
+## 子 Agent 手工测试
+
+当前只有一种子 Agent：`delegate_file_analysis` 触发的只读文件分析子 Agent。它不是通用任务路由器，也不会并行调度多个子 Agent。
+
+建议先准备一个测试文件，例如在 `workspace/hello.txt` 中写入 2 到 5 行文本，然后分别在 Web 或 CLI 中测试以下场景：
+
+1. 基础委托：
+
+```text
+请使用 delegate_file_analysis 分析 workspace/hello.txt 的主要内容，并给出一句总结。
+```
+
+2. 自然语言委托：
+
+```text
+请分析 workspace/hello.txt，但不要直接抄全文，先委托子 Agent 再总结。
+```
+
+3. 越界失败：
+
+```text
+请分析 ../README.md
+```
+
+4. 普通工具对照：
+
+```text
+列出 workspace 文件
+```
+
+判断标准如下：
+
+- Web 前端：同一个 assistant 消息时间线里应出现 `delegate_file_analysis` 这个工具名；对应 Observation JSON 里应包含 `analysis` 字段。
+- CLI：终端输出里应出现 `[Step N Action]` 下的 `delegate_file_analysis(...)`，以及 `[Step N Observation]` 中包含 `analysis`。
+- 最终回答：应基于 `analysis` 字段做总结，而不是只原样返回工具 JSON。
+- 越界测试：应体现 `workspace/` 路径限制，不能成功读取 `../README.md`。
+- 对照测试：`列出 workspace 文件` 更可能调用 `list_files`，用于区分普通工具调用和子 Agent 委托。
 
 ## 总结
 

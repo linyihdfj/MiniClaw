@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniClaw Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Serif+SC:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/styles/atom-one-light.min.css?v=20260427a" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <style>
+    :root {
+      --bg-main: #faf7f2;
+      --bg-panel: #fffdf8;
+      --bg-panel-muted: #f4efe4;
+      --ink-strong: #1a2a3a;
+      --ink-normal: #2f4154;
+      --ink-soft: #5f6f80;
+      --accent: #0d7c66;
+      --accent-warm: #dd6b4d;
+      --line: #d8cec1;
+      --shadow: 0 20px 45px rgba(23, 31, 39, 0.12);
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --radius-sm: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      min-height: 100vh;
+      font-family: "Space Grotesk", "PingFang SC", sans-serif;
+      color: var(--ink-normal);
+      background:
+        radial-gradient(circle at 15% 20%, rgba(13, 124, 102, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 10%, rgba(221, 107, 77, 0.14) 0%, transparent 36%),
+        linear-gradient(160deg, #fcfaf4, #f3eee2 45%, #f8f5ef 100%);
+      overflow-x: hidden;
+    }
+
+    .ambient-shape {
+      position: fixed;
+      z-index: -1;
+      width: 280px;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      filter: blur(40px);
+      opacity: 0.35;
+      pointer-events: none;
+    }
+
+    .ambient-shape.one {
+      background: #8dcfbe;
+      left: -80px;
+      top: 40px;
+    }
+
+    .ambient-shape.two {
+      background: #f0b79e;
+      right: -90px;
+      top: 190px;
+    }
+
+    .app {
+      width: min(1220px, 92vw);
+      margin: 24px auto 36px;
+      display: grid;
+      gap: 16px;
+      animation: rise 480ms ease-out;
+    }
+
+    @keyframes rise {
+      from {
+        transform: translateY(16px);
+        opacity: 0;
+      }
+      to {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+
+    .topbar {
+      background: color-mix(in srgb, var(--bg-panel) 92%, #ffffff 8%);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      padding: 14px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand h1 {
+      font-family: "Noto Serif SC", serif;
+      font-size: clamp(22px, 2.6vw, 30px);
+      color: var(--ink-strong);
+      letter-spacing: 0.02em;
+    }
+
+    .brand p {
+      color: var(--ink-soft);
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    .top-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-pill {
+      padding: 7px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-strong);
+      background: var(--bg-panel-muted);
+      border: 1px solid var(--line);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #8e9aa6;
+    }
+
+    .status-pill.working .status-dot {
+      background: var(--accent-warm);
+      animation: pulse 1.1s infinite;
+    }
+
+    .status-pill.success .status-dot {
+      background: var(--accent);
+    }
+
+    .status-pill.error .status-dot {
+      background: #c0392b;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.35); opacity: 0.5; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    select,
+    button,
+    textarea {
+      font: inherit;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line);
+      background: var(--bg-panel);
+      color: var(--ink-normal);
+      transition: transform 120ms ease, box-shadow 160ms ease, border-color 120ms ease;
+    }
+
+    select,
+    button {
+      height: 38px;
+      padding: 0 12px;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, #0e9278, #0d7c66);
+      border: none;
+      color: #ffffff;
+    }
+
+    button.primary:hover:enabled {
+      transform: translateY(-1px);
+      box-shadow: 0 9px 18px rgba(13, 124, 102, 0.28);
+    }
+
+    button.secondary {
+      background: #fff6f3;
+      color: #8b3a2f;
+      border-color: #ebc8bd;
+    }
+
+    button:hover:enabled,
+    select:hover,
+    textarea:hover {
+      border-color: #c5b6a6;
+    }
+
+    button:disabled,
+    select:disabled,
+    textarea:disabled {
+      cursor: not-allowed;
+      opacity: 0.65;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      min-height: 560px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 239, 228, 0.92));
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .panel-head h2 {
+      color: var(--ink-strong);
+      font-size: 17px;
+      letter-spacing: 0.03em;
+    }
+
+    .panel-head p {
+      color: var(--ink-soft);
+      font-size: 13px;
+    }
+
+    .chat-log {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+      scrollbar-width: thin;
+      scrollbar-color: #d4c6b6 transparent;
+    }
+
+    .chat-log {
+      background: linear-gradient(180deg, #fffdf8 0%, #fbf7ef 100%);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .message {
+      max-width: 95%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      animation: slide 220ms ease-out;
+    }
+
+    @keyframes slide {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: linear-gradient(130deg, #0f8d73, #0d7c66);
+      color: #ffffff;
+      border: none;
+      box-shadow: 0 10px 20px rgba(13, 124, 102, 0.24);
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: #fff9f2;
+    }
+
+    .message.error {
+      align-self: flex-start;
+      background: #fff1ef;
+      border-color: #f1c3bc;
+      color: #8b3a2f;
+    }
+
+    .composer {
+      border-top: 1px solid var(--line);
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      background: #f8f3e9;
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 62px;
+      max-height: 180px;
+      padding: 10px 11px;
+      line-height: 1.45;
+    }
+
+    .markdown-body {
+      line-height: 1.7;
+      font-size: 15px;
+      color: var(--ink-normal);
+    }
+
+    .markdown-body p,
+    .markdown-body ul,
+    .markdown-body ol,
+    .markdown-body pre,
+    .markdown-body blockquote,
+    .markdown-body table {
+      margin: 0.5em 0;
+    }
+
+    .markdown-body code {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.92em;
+      background: #f1ebdf;
+      padding: 0.15em 0.34em;
+      border-radius: 6px;
+    }
+
+    .markdown-body pre {
+      border: 1px solid #e4d8c8;
+      border-radius: 10px;
+      overflow: auto;
+      background: #f8f6f0;
+    }
+
+    .markdown-body pre code {
+      display: block;
+      padding: 1em;
+      background: transparent;
+    }
+
+    .markdown-body table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .markdown-body th,
+    .markdown-body td {
+      border: 1px solid #e3d7c7;
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    .markdown-body blockquote {
+      padding: 8px 10px;
+      border-left: 4px solid #c8b198;
+      background: #f4ede1;
+      color: #4e5e6f;
+      border-radius: 8px;
+    }
+
+    .assistant-turn {
+      display: grid;
+      gap: 12px;
+    }
+
+    .assistant-turn h3 {
+      color: var(--ink-strong);
+      font-size: 15px;
+    }
+
+    .assistant-turn .turn-question {
+      color: #48607a;
+      font-size: 13px;
+      word-break: break-word;
+    }
+
+    .assistant-placeholder {
+      color: #9a8e7f;
+      font-style: italic;
+      font-size: 14px;
+    }
+
+    .turn-timeline {
+      display: grid;
+      gap: 10px;
+    }
+
+    .timeline-item {
+      border: 1px solid #dccdbc;
+      border-radius: 12px;
+      background: #ffffff;
+      overflow: hidden;
+    }
+
+    .timeline-label {
+      padding: 10px 12px;
+      border-bottom: 1px solid #e5d7c6;
+      background: #f7efe2;
+      font-size: 12px;
+      font-weight: 700;
+      color: #1f3550;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .timeline-item.thought .timeline-label {
+      background: #fff2df;
+      color: #7b4e24;
+    }
+
+    .timeline-item.action .timeline-label {
+      background: #edf4fb;
+      color: #214f77;
+    }
+
+    .timeline-item.observation .timeline-label {
+      background: #eef8ef;
+      color: #2b6a42;
+    }
+
+    .timeline-item.final-answer .timeline-label {
+      background: #f9f0e4;
+      color: #6f4a20;
+    }
+
+    .timeline-body {
+      padding: 12px;
+    }
+
+    .timeline-item pre {
+      margin: 0;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: #35516d;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .action-tool {
+      margin-bottom: 8px;
+    }
+
+    .tool-name {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      color: #ffffff;
+      background: #2f597d;
+    }
+
+    @media (max-width: 980px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .panel {
+        min-height: 420px;
+      }
+
+      .topbar {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .top-controls {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient-shape one"></div>
+  <div class="ambient-shape two"></div>
+
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <h1>MiniClaw Studio</h1>
+        <p>Markdown 对话 + 单框时间线展示 Thought / Action / Observation / Final Answer</p>
+      </div>
+      <div class="top-controls">
+        <label>
+          <select id="modelSelect" title="选择模型"></select>
+        </label>
+        <button id="clearBtn" class="secondary" type="button">清空会话</button>
+        <div id="statusPill" class="status-pill">
+          <span class="status-dot"></span>
+          <span id="statusText">就绪</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="grid">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Conversation</h2>
+          <p>按时间顺序展示推理、工具调用、观察结果与最终回答</p>
+        </div>
+        <div id="chatLog" class="chat-log"></div>
+        <form id="chatForm" class="composer">
+          <textarea id="inputBox" placeholder="输入你的问题。支持让模型读取 workspace、调用工具并返回 Markdown。" required></textarea>
+          <button id="sendBtn" class="primary" type="submit">发送</button>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@13.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/highlight.min.js?v=20260427b"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <script>
+    const chatLog = document.getElementById("chatLog");
+    const chatForm = document.getElementById("chatForm");
+    const inputBox = document.getElementById("inputBox");
+    const sendBtn = document.getElementById("sendBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const modelSelect = document.getElementById("modelSelect");
+    const statusPill = document.getElementById("statusPill");
+    const statusText = document.getElementById("statusText");
+
+    if (window.hljs && typeof window.hljs.configure === "function") {
+      window.hljs.configure({
+        ignoreUnescapedHTML: true,
+      });
+    }
+
+    marked.setOptions({
+      gfm: true,
+      breaks: false,
+    });
+
+    const state = {
+      busy: false,
+      turnId: 0,
+      activeTurn: null,
+    };
+
+    function setStatus(text, tone) {
+      statusText.textContent = text;
+      statusPill.classList.remove("working", "success", "error");
+      if (tone) {
+        statusPill.classList.add(tone);
+      }
+    }
+
+    function renderMarkdown(target, markdown) {
+      const source = markdown || "";
+      const unsafeHtml = marked.parse(source);
+      target.innerHTML = DOMPurify.sanitize(unsafeHtml, { USE_PROFILES: { html: true } });
+
+      const codeBlocks = target.querySelectorAll("pre code");
+      if (window.hljs && typeof window.hljs.highlightElement === "function") {
+        codeBlocks.forEach((block) => {
+          window.hljs.highlightElement(block);
+        });
+      }
+
+      if (window.renderMathInElement) {
+        renderMathInElement(target, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "$", right: "$", display: false },
+          ],
+          throwOnError: false,
+          strict: "ignore",
+        });
+      }
+    }
+
+    function scrollChatToBottom() {
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function appendUserMessage(text) {
+      const bubble = document.createElement("article");
+      bubble.className = "message user";
+      bubble.textContent = text;
+      chatLog.appendChild(bubble);
+      scrollChatToBottom();
+    }
+
+    function appendErrorMessage(text) {
+      const bubble = document.createElement("article");
+      bubble.className = "message error";
+      bubble.textContent = text;
+      chatLog.appendChild(bubble);
+      scrollChatToBottom();
+    }
+
+    function prepareAssistantMessage(question) {
+      state.turnId += 1;
+
+      const bubble = document.createElement("article");
+      bubble.className = "message assistant";
+
+      const wrap = document.createElement("section");
+      wrap.className = "assistant-turn";
+
+      const title = document.createElement("h3");
+      title.textContent = `Assistant · Turn ${state.turnId}`;
+
+      const questionEl = document.createElement("p");
+      questionEl.className = "turn-question";
+      questionEl.textContent = question;
+
+      const timeline = document.createElement("div");
+      timeline.className = "turn-timeline";
+
+      const placeholder = document.createElement("p");
+      placeholder.className = "assistant-placeholder";
+      placeholder.textContent = "等待模型响应...";
+
+      timeline.appendChild(placeholder);
+      wrap.appendChild(title);
+      wrap.appendChild(questionEl);
+      wrap.appendChild(timeline);
+      bubble.appendChild(wrap);
+      chatLog.appendChild(bubble);
+      scrollChatToBottom();
+
+      state.activeTurn = {
+        bubble,
+        timeline,
+        placeholder,
+        currentStep: 0,
+        reasoningSteps: new Set(),
+        thoughtItems: new Map(),
+        actionItems: new Map(),
+        observationItems: new Map(),
+        finalAnswerItem: null,
+        finalAnswerBuffer: "",
+      };
+    }
+
+    function clearActivePlaceholder() {
+      if (!state.activeTurn || !state.activeTurn.placeholder) {
+        return;
+      }
+      state.activeTurn.placeholder.remove();
+      state.activeTurn.placeholder = null;
+    }
+
+    function createTimelineItem(kind, label) {
+      if (!state.activeTurn) {
+        return null;
+      }
+
+      clearActivePlaceholder();
+
+      const item = document.createElement("section");
+      item.className = `timeline-item ${kind}`;
+
+      const labelEl = document.createElement("div");
+      labelEl.className = "timeline-label";
+      labelEl.textContent = label;
+
+      const body = document.createElement("div");
+      body.className = "timeline-body";
+
+      item.appendChild(labelEl);
+      item.appendChild(body);
+      state.activeTurn.timeline.appendChild(item);
+      scrollChatToBottom();
+
+      return { item, body, labelEl };
+    }
+
+    function ensureThoughtItem(step) {
+      if (!state.activeTurn) {
+        return null;
+      }
+
+      const displayStep = step || 1;
+      const key = String(displayStep);
+      const cached = state.activeTurn.thoughtItems.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const entry = createTimelineItem("thought", `Thought · Step ${displayStep}`);
+      if (!entry) {
+        return null;
+      }
+
+      const content = document.createElement("div");
+      content.className = "markdown-body";
+      entry.body.appendChild(content);
+
+      const thoughtItem = { content, buffer: "" };
+      state.activeTurn.thoughtItems.set(key, thoughtItem);
+      return thoughtItem;
+    }
+
+    function appendThoughtDelta(step, delta) {
+      if (!delta) {
+        return;
+      }
+      const thoughtItem = ensureThoughtItem(step);
+      if (!thoughtItem) {
+        return;
+      }
+
+      thoughtItem.buffer += delta;
+      renderMarkdown(thoughtItem.content, thoughtItem.buffer);
+      scrollChatToBottom();
+    }
+
+    function renderThought(step, content) {
+      const thoughtItem = ensureThoughtItem(step);
+      if (!thoughtItem) {
+        return;
+      }
+
+      const normalized = content || "模型准备调用工具。";
+      if (!thoughtItem.buffer) {
+        thoughtItem.buffer = normalized;
+      } else if (normalized.startsWith(thoughtItem.buffer)) {
+        thoughtItem.buffer = normalized;
+      } else if (thoughtItem.buffer !== normalized) {
+        thoughtItem.buffer = normalized;
+      }
+
+      renderMarkdown(thoughtItem.content, thoughtItem.buffer || normalized);
+      scrollChatToBottom();
+    }
+
+    function ensureActionItem(step, toolIndex) {
+      if (!state.activeTurn) {
+        return null;
+      }
+
+      const displayStep = step || 1;
+      const displayIndex = Number.isFinite(toolIndex) ? toolIndex : 0;
+      const key = `${displayStep}:${displayIndex}`;
+      const cached = state.activeTurn.actionItems.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const entry = createTimelineItem("action", `Action · Step ${displayStep} · Tool #${displayIndex}`);
+      if (!entry) {
+        return null;
+      }
+
+      const toolRow = document.createElement("div");
+      toolRow.className = "action-tool";
+
+      const badge = document.createElement("span");
+      badge.className = "tool-name";
+      toolRow.appendChild(badge);
+
+      const pre = document.createElement("pre");
+      entry.body.appendChild(toolRow);
+      entry.body.appendChild(pre);
+
+      const actionItem = { badge, pre };
+      state.activeTurn.actionItems.set(key, actionItem);
+      return actionItem;
+    }
+
+    function formatActionArguments(argumentsObj) {
+      if (argumentsObj && typeof argumentsObj === "object") {
+        if ("_partial" in argumentsObj) {
+          return String(argumentsObj._partial || "");
+        }
+        if ("_value" in argumentsObj) {
+          return JSON.stringify(argumentsObj._value, null, 2);
+        }
+      }
+      return JSON.stringify(argumentsObj || {}, null, 2);
+    }
+
+    function upsertAction(step, tool, argumentsObj, toolIndex) {
+      const actionItem = ensureActionItem(step, toolIndex);
+      if (!actionItem) {
+        return;
+      }
+      actionItem.badge.textContent = tool || "unknown_tool";
+      actionItem.pre.textContent = formatActionArguments(argumentsObj);
+      scrollChatToBottom();
+    }
+
+    function renderAction(step, tool, argumentsObj, toolIndex) {
+      upsertAction(step, tool, argumentsObj, toolIndex);
+    }
+
+    function renderActionDelta(step, tool, argumentsObj, toolIndex) {
+      upsertAction(step, tool, argumentsObj, toolIndex);
+    }
+
+    function formatObservation(rawContent) {
+      if (typeof rawContent !== "string") {
+        return JSON.stringify(rawContent, null, 2);
+      }
+      try {
+        return JSON.stringify(JSON.parse(rawContent), null, 2);
+      } catch {
+        return rawContent;
+      }
+    }
+
+    function ensureObservationItem(step, toolIndex) {
+      if (!state.activeTurn) {
+        return null;
+      }
+
+      const displayStep = step || 1;
+      const displayIndex = Number.isFinite(toolIndex) ? toolIndex : 0;
+      const key = `${displayStep}:${displayIndex}`;
+      const cached = state.activeTurn.observationItems.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const entry = createTimelineItem(
+        "observation",
+        `Observation · Step ${displayStep} · Tool #${displayIndex}`
+      );
+      if (!entry) {
+        return null;
+      }
+
+      const pre = document.createElement("pre");
+      entry.body.appendChild(pre);
+
+      const observationItem = { pre, buffer: "", finalContent: "" };
+      state.activeTurn.observationItems.set(key, observationItem);
+      return observationItem;
+    }
+
+    function appendObservationDelta(step, content, toolIndex) {
+      if (!content) {
+        return;
+      }
+      const observationItem = ensureObservationItem(step, toolIndex);
+      if (!observationItem) {
+        return;
+      }
+
+      observationItem.buffer += `${content}\n`;
+      observationItem.pre.textContent = observationItem.buffer;
+      scrollChatToBottom();
+    }
+
+    function renderObservationStart(step, content, toolIndex) {
+      appendObservationDelta(step, content || "开始执行工具。", toolIndex);
+    }
+
+    function renderObservation(step, content, toolIndex) {
+      const observationItem = ensureObservationItem(step, toolIndex);
+      if (!observationItem) {
+        return;
+      }
+
+      observationItem.finalContent = content || "";
+      observationItem.pre.textContent = formatObservation(observationItem.finalContent);
+      scrollChatToBottom();
+    }
+
+    function appendReasoningDelta(step, delta) {
+      if (!state.activeTurn || !delta) {
+        return;
+      }
+      state.activeTurn.reasoningSteps.add(String(step));
+      appendThoughtDelta(step, delta);
+    }
+
+    function ensureFinalAnswerItem() {
+      if (!state.activeTurn) {
+        return null;
+      }
+      if (state.activeTurn.finalAnswerItem) {
+        return state.activeTurn.finalAnswerItem;
+      }
+
+      const entry = createTimelineItem("final-answer", "Final Answer");
+      if (!entry) {
+        return null;
+      }
+
+      const content = document.createElement("div");
+      content.className = "markdown-body";
+      entry.body.appendChild(content);
+
+      state.activeTurn.finalAnswerItem = { content };
+      return state.activeTurn.finalAnswerItem;
+    }
+
+    function appendAssistantMarkdown(fragment) {
+      if (!fragment || !state.activeTurn) {
+        return;
+      }
+      const finalAnswerItem = ensureFinalAnswerItem();
+      if (!finalAnswerItem) {
+        return;
+      }
+
+      state.activeTurn.finalAnswerBuffer += fragment;
+      renderMarkdown(finalAnswerItem.content, state.activeTurn.finalAnswerBuffer);
+      scrollChatToBottom();
+    }
+
+    function parseSseFrame(frameText) {
+      const lines = frameText.replaceAll("\r", "").split("\n");
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      if (!dataLines.length) {
+        return null;
+      }
+
+      const payloadText = dataLines.join("\n");
+      try {
+        return JSON.parse(payloadText);
+      } catch {
+        return null;
+      }
+    }
+
+    function handleEvent(event) {
+      const name = event.event;
+      if (name === "reasoning_delta") {
+        const step = state.activeTurn?.currentStep || 1;
+        appendReasoningDelta(step, event.delta || "");
+        return;
+      }
+
+      if (name === "content_delta") {
+        appendAssistantMarkdown(event.delta || "");
+        return;
+      }
+
+      if (name === "final_answer") {
+        appendAssistantMarkdown(event.content || "");
+        return;
+      }
+
+      if (name === "tao") {
+        const step = Number(event.step) || 0;
+        const toolIndexValue = Number(event.tool_index);
+        const toolIndex = Number.isFinite(toolIndexValue) ? toolIndexValue : undefined;
+
+        if (event.phase === "step_start") {
+          if (state.activeTurn) {
+            state.activeTurn.currentStep = step || 1;
+          }
+          return;
+        }
+        if (event.phase === "thought_delta") {
+          if (!state.activeTurn?.reasoningSteps.has(String(step))) {
+            appendThoughtDelta(step, event.content || "");
+          }
+          return;
+        }
+        if (event.phase === "thought") {
+          renderThought(step, event.content || "");
+          return;
+        }
+        if (event.phase === "action_delta") {
+          renderActionDelta(step, event.tool || "", event.arguments || {}, toolIndex);
+          return;
+        }
+        if (event.phase === "action") {
+          renderAction(step, event.tool || "", event.arguments || {}, toolIndex);
+          return;
+        }
+        if (event.phase === "observation_start") {
+          renderObservationStart(step, event.content || "", toolIndex);
+          return;
+        }
+        if (event.phase === "observation_delta") {
+          appendObservationDelta(step, event.content || "", toolIndex);
+          return;
+        }
+        if (event.phase === "observation") {
+          renderObservation(step, event.content || "", toolIndex);
+        }
+        return;
+      }
+
+      if (name === "error") {
+        appendErrorMessage(`服务错误: ${event.message || "未知错误"}`);
+        setStatus("出错", "error");
+      }
+    }
+
+    async function consumeSseFromFetch(response) {
+      if (!response.body) {
+        throw new Error("浏览器不支持流式响应。");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let pending = "";
+      let completed = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        pending += decoder.decode(value, { stream: true });
+        let splitIndex = pending.indexOf("\n\n");
+
+        while (splitIndex !== -1) {
+          const frame = pending.slice(0, splitIndex);
+          pending = pending.slice(splitIndex + 2);
+          splitIndex = pending.indexOf("\n\n");
+
+          if (!frame || frame.startsWith(":")) {
+            continue;
+          }
+
+          const parsed = parseSseFrame(frame);
+          if (!parsed) {
+            continue;
+          }
+          handleEvent(parsed);
+          if (parsed.event === "done") {
+            completed = true;
+          }
+        }
+      }
+
+      return completed;
+    }
+
+    async function sendMessage(message) {
+      const response = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `请求失败: ${response.status}`);
+      }
+
+      return consumeSseFromFetch(response);
+    }
+
+    async function refreshModels() {
+      try {
+        const response = await fetch("/api/models");
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || "模型查询失败");
+        }
+
+        const models = payload.models || [];
+        modelSelect.innerHTML = "";
+        for (const model of models) {
+          const option = document.createElement("option");
+          option.value = model;
+          option.textContent = model;
+          if (model === payload.current) {
+            option.selected = true;
+          }
+          modelSelect.appendChild(option);
+        }
+      } catch (err) {
+        setStatus("模型加载失败", "error");
+        appendErrorMessage(`模型信息不可用: ${err.message}`);
+      }
+    }
+
+    async function switchModel(model) {
+      const response = await fetch("/api/model", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || payload.error || "模型切换失败");
+      }
+    }
+
+    async function clearConversation() {
+      const response = await fetch("/api/clear", { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.error || "清空失败");
+      }
+      chatLog.innerHTML = "";
+      state.activeTurn = null;
+      state.turnId = 0;
+      setStatus("会话已清空", "success");
+    }
+
+    chatForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = inputBox.value.trim();
+      if (!message || state.busy) {
+        return;
+      }
+
+      state.busy = true;
+      sendBtn.disabled = true;
+      inputBox.disabled = true;
+      modelSelect.disabled = true;
+      clearBtn.disabled = true;
+      setStatus("响应中", "working");
+
+      appendUserMessage(message);
+      prepareAssistantMessage(message);
+      inputBox.value = "";
+
+      try {
+        await sendMessage(message);
+
+        if (!state.activeTurn?.finalAnswerBuffer && state.activeTurn) {
+          appendAssistantMarkdown("模型未返回正文内容。");
+        }
+        setStatus("完成", "success");
+      } catch (err) {
+        appendErrorMessage(`请求失败: ${err.message}`);
+        setStatus("失败", "error");
+      } finally {
+        state.busy = false;
+        sendBtn.disabled = false;
+        inputBox.disabled = false;
+        modelSelect.disabled = false;
+        clearBtn.disabled = false;
+        inputBox.focus();
+      }
+    });
+
+    modelSelect.addEventListener("change", async () => {
+      if (state.busy) {
+        return;
+      }
+      try {
+        setStatus("切换模型中", "working");
+        await switchModel(modelSelect.value);
+        setStatus("模型已更新", "success");
+      } catch (err) {
+        appendErrorMessage(`模型切换失败: ${err.message}`);
+        setStatus("切换失败", "error");
+      }
+    });
+
+    clearBtn.addEventListener("click", async () => {
+      if (state.busy) {
+        return;
+      }
+      try {
+        await clearConversation();
+      } catch (err) {
+        appendErrorMessage(`清空会话失败: ${err.message}`);
+        setStatus("清空失败", "error");
+      }
+    });
+
+    window.addEventListener("load", async () => {
+      await refreshModels();
+      inputBox.focus();
+      setStatus("就绪", "success");
+    });
+  </script>
+</body>
+</html>
