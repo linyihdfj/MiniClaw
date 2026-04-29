@@ -106,19 +106,11 @@ def create_app() -> FastAPI:
             try:
                 # 共享 turn_lock，避免 Web 和 CLI 同时修改同一段对话历史。
                 with runtime.turn_lock:
-                    answer = runtime.get_state().agent.run_turn(
+                    runtime.get_agent().run_turn(
                         message,
-                        on_content_delta=lambda delta: emit(
-                            {"event": "content_delta", "delta": delta}
-                        ),
-                        on_reasoning_delta=lambda delta: emit(
-                            {"event": "reasoning_delta", "delta": delta}
-                        ),
                         on_trace=lambda trace_event: emit(_map_trace_event(trace_event)),
+                        on_stream_event=emit,
                     )
-
-                if answer:
-                    emit({"event": "final_answer", "content": answer})
             except Exception as exc:  # pragma: no cover - runtime guard
                 emit({"event": "error", "message": str(exc)})
             finally:
@@ -157,6 +149,7 @@ def _map_trace_event(event: dict[str, Any]) -> dict[str, Any]:
         "step": int(event.get("step") or 0),
         "agent_role": str(event.get("agent_role") or "main"),
         "agent_name": str(event.get("agent_name") or "MiniClaw"),
+        "stream_id": str(event.get("stream_id") or "main"),
     }
 
     if "tool_index" in event:

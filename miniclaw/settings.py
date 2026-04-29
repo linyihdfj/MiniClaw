@@ -7,11 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class DeepSeekSettings(BaseSettings):
     # BaseSettings 会自动从 .env 和环境变量加载字段。
     api_key: str = Field(alias="DEEPSEEK_API_KEY")
-    base_url: str = Field(
-        default="https://api.deepseek.com/beta",
-        alias="DEEPSEEK_BASE_URL",
-    )
-    model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    model: str = Field(default="deepseek-v4-flash", alias="DEEPSEEK_MODEL")
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,54 +1,62 @@
 from __future__ import annotations
 
-import httpx
+import os
+from copy import deepcopy
+
 from pydantic import ValidationError
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
 
 from .settings import DeepSeekSettings
 
 
 class ConfigError(Exception):
-    """Raised when required runtime configuration is missing."""
+    """Raised when required runtime configuration is missing or invalid."""
 
 
-class LLMError(Exception):
-    """Raised when the LLM API request fails or returns invalid data."""
+MODEL_SETTINGS = {
+    "deepseek-v4-flash": {
+        "extra_body": {
+            "thinking": {
+                "type": "disabled",
+            }
+        }
+    },
+    "deepseek-v4-pro": {
+        "extra_body": {
+            "thinking": {
+                "type": "enabled",
+            }
+        },
+        "openai_reasoning_effort": "high",
+    },
+}
+
+MODELS = tuple(MODEL_SETTINGS)
+MODEL_ALIASES = {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-pro",
+}
 
 
-class DeepSeekClient:
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60):
-        self.api_key = api_key
-        self.base_url = base_url
-        self.model = model
-        self.timeout = timeout
-        # provider 与 http_client 会被主 Agent 和子 Agent 复用。
-        self.http_client = httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=False,
-        )
-        self.provider = OpenAIProvider(
-            base_url=base_url,
-            api_key=api_key,
-            http_client=self.http_client,
-        )
+def normalize_model(model: str) -> str:
+    model = MODEL_ALIASES.get(model, model)
+    if model not in MODEL_SETTINGS:
+        raise ConfigError(f"不支持的模型：{model}。可选：{', '.join(MODELS)}")
+    return model
 
-    @classmethod
-    def from_env(cls) -> "DeepSeekClient":
-        try:
-            settings = DeepSeekSettings()
-        except ValidationError as exc:
-            raise ConfigError(
-                "请先设置 DEEPSEEK_API_KEY。你可以在项目根目录 .env 中写入："
-                "DEEPSEEK_API_KEY=你的 key"
-            ) from exc
 
-        return cls(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            model=settings.model,
-        )
+def load_default_model() -> str:
+    try:
+        settings = DeepSeekSettings()
+    except ValidationError as exc:
+        raise ConfigError(
+            "请先设置 DEEPSEEK_API_KEY。你可以在项目根目录 .env 中写入："
+            "DEEPSEEK_API_KEY=你的 key"
+        ) from exc
 
-    def create_model(self) -> OpenAIChatModel:
-        # pydantic-ai 通过 OpenAI-compatible provider 调用 DeepSeek。
-        return OpenAIChatModel(self.model, provider=self.provider)
+    os.environ["DEEPSEEK_API_KEY"] = settings.api_key
+    return normalize_model(settings.model)
+
+
+def resolve_model(model: str) -> tuple[str, dict[str, Any]]:
+    model = normalize_model(model)
+    return f"deepseek:{model}", deepcopy(MODEL_SETTINGS[model])

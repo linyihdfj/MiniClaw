@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -175,7 +176,9 @@ class ToolRegistry:
             _TOOL_EVENT_CALLBACK.reset(token)
 
 
-def create_default_registry(client: Any | None = None) -> ToolRegistry:
+def create_default_registry(
+    get_model: Callable[[], str] | None = None,
+) -> ToolRegistry:
     WORKSPACE_DIR.mkdir(exist_ok=True)
 
     registry = ToolRegistry()
@@ -183,8 +186,8 @@ def create_default_registry(client: Any | None = None) -> ToolRegistry:
     register_shell_tool(registry)
     register_web_tools(registry)
     register_utility_tools(registry)
-    if client is not None:
-        register_delegate_tool(registry, client)
+    if get_model is not None:
+        register_delegate_tool(registry, get_model)
     load_plugins(registry)
     return registry
 
@@ -389,7 +392,10 @@ def register_shell_tool(registry: ToolRegistry) -> None:
     )
 
 
-def register_delegate_tool(registry: ToolRegistry, client: Any) -> None:
+def register_delegate_tool(
+    registry: ToolRegistry,
+    get_model: Callable[[], str],
+) -> None:
     registry.register(
         Tool(
             name="delegate_file_analysis",
@@ -407,7 +413,7 @@ def register_delegate_tool(registry: ToolRegistry, client: Any) -> None:
                     },
                 },
             },
-            function=_make_delegate_file_analysis(client),
+            function=_make_delegate_file_analysis(get_model),
         )
     )
 
@@ -526,18 +532,19 @@ def emit_tool_event(
     kind: str,
     content: str,
     data: dict[str, Any] | None = None,
+    **extra: Any,
 ) -> None:
     callback = _TOOL_EVENT_CALLBACK.get()
     if callback is None:
         return
 
-    callback(
-        {
-            "type": kind,
-            "content": content,
-            "data": data or {},
-        }
-    )
+    payload = {
+        "type": kind,
+        "content": content,
+        "data": data or {},
+    }
+    payload.update(extra)
+    callback(payload)
 
 
 def load_plugins(registry: ToolRegistry, plugins_dir: Path = PLUGINS_DIR) -> None:
@@ -1165,10 +1172,11 @@ def _safe_workspace_path(relative_path: str) -> Path:
     return resolved
 
 
-def _make_delegate_file_analysis(client: Any) -> ToolFunction:
+def _make_delegate_file_analysis(get_model: Callable[[], str]) -> ToolFunction:
     def delegate_file_analysis(relative_path: str, task: str) -> dict[str, Any]:
         from .subagents import AnalysisSubAgent
 
+        stream_id = f"sub-{uuid4().hex}"
         emit_tool_event(
             "delegation_start",
             f"主 Agent 准备把文件分析任务委托给子 Agent：{relative_path}",
@@ -1176,19 +1184,49 @@ def _make_delegate_file_analysis(client: Any) -> ToolFunction:
                 "relative_path": relative_path,
                 "task": task,
                 "status": "delegation_started",
+                "stream_id": stream_id,
                 "agent_role": "main",
                 "agent_name": "MiniClaw",
             },
+            stream_id="main",
         )
-        subagent = AnalysisSubAgent(client)
+
+        def forward_subagent_event(event: dict[str, Any]) -> None:
+            event_type = str(event.get("type") or event.get("event") or "delegation_progress")
+            content = str(event.get("content") or event.get("delta") or "")
+            data = {
+                "relative_path": relative_path,
+                "task": task,
+                "stream_id": stream_id,
+                "agent_role": str(event.get("agent_role") or "sub"),
+                "agent_name": str(event.get("agent_name") or "AnalysisSubAgent"),
+                **(event.get("data") or {}),
+            }
+            extra = {
+                "stream_id": str(event.get("stream_id") or stream_id),
+                "agent_role": str(event.get("agent_role") or "sub"),
+                "agent_name": str(event.get("agent_name") or "AnalysisSubAgent"),
+            }
+            if "step" in event:
+                extra["step"] = event.get("step")
+            if "tool_index" in event:
+                extra["tool_index"] = event.get("tool_index")
+            if "tool" in event:
+                extra["tool"] = event.get("tool")
+            if "arguments" in event:
+                extra["arguments"] = event.get("arguments") or {}
+            emit_tool_event(
+                event_type,
+                content,
+                data,
+                **extra,
+            )
+        subagent = AnalysisSubAgent(get_model())
         analysis = subagent.analyze(
             relative_path=relative_path,
             task=task,
-            on_event=lambda event: emit_tool_event(
-                str(event.get("type") or "delegation_progress"),
-                str(event.get("content") or ""),
-                event.get("data") or {},
-            ),
+            stream_id=stream_id,
+            on_event=forward_subagent_event,
         )
         emit_tool_event(
             "delegation_result",
@@ -1197,10 +1235,11 @@ def _make_delegate_file_analysis(client: Any) -> ToolFunction:
                 "relative_path": relative_path,
                 "task": task,
                 "status": "delegation_completed",
+                "stream_id": stream_id,
                 "agent_role": "main",
                 "agent_name": "MiniClaw",
-                "subagent_result": analysis,
             },
+            stream_id="main",
         )
         return {
             "relative_path": relative_path,
@@ -1208,6 +1247,7 @@ def _make_delegate_file_analysis(client: Any) -> ToolFunction:
             "analysis": analysis,
             "agent_role": "sub",
             "agent_name": "AnalysisSubAgent",
+            "stream_id": stream_id,
             "phase": "subagent_result",
         }
 

@@ -117,6 +117,12 @@
       gap: 10px;
     }
 
+    .model-hint {
+      font-size: 12px;
+      color: var(--ink-soft);
+      padding: 0 2px;
+    }
+
     .status-pill {
       padding: 7px 12px;
       border-radius: 999px;
@@ -540,12 +546,13 @@
     <header class="topbar">
       <div class="brand">
         <h1>MiniClaw Studio</h1>
-        <p>Markdown 对话 + 单框时间线展示 Thought / Action / Observation / Final Answer</p>
+        <p>DeepSeek V4 预设切换 + Markdown 对话 + 单框时间线展示 Thought / Action / Observation / Final Answer</p>
       </div>
       <div class="top-controls">
         <label>
           <select id="modelSelect" title="选择模型"></select>
         </label>
+        <span id="modelHint" class="model-hint">加载模型预设中...</span>
         <button id="clearBtn" class="secondary" type="button">清空会话</button>
         <div id="statusPill" class="status-pill">
           <span class="status-dot"></span>
@@ -581,6 +588,7 @@
     const sendBtn = document.getElementById("sendBtn");
     const clearBtn = document.getElementById("clearBtn");
     const modelSelect = document.getElementById("modelSelect");
+    const modelHint = document.getElementById("modelHint");
     const statusPill = document.getElementById("statusPill");
     const statusText = document.getElementById("statusText");
 
@@ -601,6 +609,11 @@
       activeTurn: null,
     };
 
+    const MODEL_LABELS = {
+      "deepseek-v4-flash": "Flash 快速模式，默认关闭 thinking",
+      "deepseek-v4-pro": "Pro 深度模式，默认开启 thinking",
+    };
+
     const apiBase = (() => {
       if (window.location && window.location.origin && window.location.origin !== "null") {
         return window.location.origin;
@@ -610,6 +623,19 @@
 
     function apiUrl(path) {
       return `${apiBase}${path}`;
+    }
+
+    function getModelLabel(model) {
+      return MODEL_LABELS[model] || model;
+    }
+
+    function getModelOptionLabel(model) {
+      const label = MODEL_LABELS[model];
+      return label ? `${model} · ${label}` : model;
+    }
+
+    function updateModelHint(model) {
+      modelHint.textContent = getModelLabel(model);
     }
 
     function setStatus(text, tone) {
@@ -699,14 +725,7 @@
         bubble,
         timeline,
         placeholder,
-        currentStep: 0,
-        reasoningSteps: new Set(),
-        thoughtItems: new Map(),
-        actionItems: new Map(),
-        observationItems: new Map(),
-        delegationItems: new Map(),
-        finalAnswerItem: null,
-        finalAnswerBuffer: "",
+        streams: new Map(),
         hasReceivedEvent: false,
       };
     }
@@ -756,14 +775,18 @@
       const body = document.createElement("div");
       body.className = "timeline-body";
 
-      // Add click handler for toggle
-      const isTaoItem = kind === "thought" || kind === "action" || kind === "observation";
-      if (isTaoItem) {
-        item.classList.add("collapsed");
+      const collapsible = options.collapsible !== false;
+      if (collapsible) {
+        if (options.defaultCollapsed) {
+          item.classList.add("collapsed");
+        }
         labelContainer.addEventListener("click", (e) => {
           e.stopPropagation();
           item.classList.toggle("collapsed");
         });
+      } else {
+        toggle.textContent = "";
+        labelContainer.style.cursor = "default";
       }
 
       item.appendChild(labelContainer);
@@ -774,20 +797,57 @@
       return { item, body, labelEl: labelContainer };
     }
 
-    function ensureThoughtItem(step) {
+    function getAgentLabel(agentRole) {
+      return agentRole === "sub" ? "Sub Agent" : "Main Agent";
+    }
+
+    function getStreamState(streamId = "main", options = {}) {
       if (!state.activeTurn) {
+        return null;
+      }
+      const normalizedStreamId = streamId || "main";
+      const cached = state.activeTurn.streams.get(normalizedStreamId);
+      if (cached) {
+        return cached;
+      }
+
+      const agentRole = options.agentRole === "sub" ? "sub" : "main";
+      const streamState = {
+        streamId: normalizedStreamId,
+        agentRole,
+        agentLabel: getAgentLabel(agentRole),
+        currentStep: 0,
+        reasoningSteps: new Set(),
+        thoughtItems: new Map(),
+        actionItems: new Map(),
+        observationItems: new Map(),
+        delegationItems: new Map(),
+        finalAnswerItem: null,
+        finalAnswerBuffer: "",
+        moveFinalAnswerToEnd: normalizedStreamId === "main",
+      };
+      state.activeTurn.streams.set(normalizedStreamId, streamState);
+      return streamState;
+    }
+
+    function ensureThoughtItem(streamId, step, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return null;
       }
 
       const displayStep = step || 1;
       const key = String(displayStep);
-      const cached = state.activeTurn.thoughtItems.get(key);
+      const cached = streamState.thoughtItems.get(key);
       if (cached) {
         return cached;
       }
 
       const entry = createTimelineItem("thought", `Thought · Step ${displayStep}`, {
-        agentRole: "main",
+        agentRole: streamState.agentRole,
+        agentLabel: streamState.agentLabel,
+        collapsible: true,
+        defaultCollapsed: true,
       });
       if (!entry) {
         return null;
@@ -798,15 +858,15 @@
       entry.body.appendChild(content);
 
       const thoughtItem = { content, buffer: "" };
-      state.activeTurn.thoughtItems.set(key, thoughtItem);
+      streamState.thoughtItems.set(key, thoughtItem);
       return thoughtItem;
     }
 
-    function appendThoughtDelta(step, delta) {
+    function appendThoughtDelta(streamId, step, delta, options = {}) {
       if (!delta) {
         return;
       }
-      const thoughtItem = ensureThoughtItem(step);
+      const thoughtItem = ensureThoughtItem(streamId, step, options);
       if (!thoughtItem) {
         return;
       }
@@ -816,8 +876,8 @@
       scrollChatToBottom();
     }
 
-    function renderThought(step, content) {
-      const thoughtItem = ensureThoughtItem(step);
+    function renderThought(streamId, step, content, options = {}) {
+      const thoughtItem = ensureThoughtItem(streamId, step, options);
       if (!thoughtItem) {
         return;
       }
@@ -835,21 +895,25 @@
       scrollChatToBottom();
     }
 
-    function ensureActionItem(step, toolIndex) {
-      if (!state.activeTurn) {
+    function ensureActionItem(streamId, step, toolIndex, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return null;
       }
 
       const displayStep = step || 1;
       const displayIndex = Number.isFinite(toolIndex) ? toolIndex : 0;
       const key = `${displayStep}:${displayIndex}`;
-      const cached = state.activeTurn.actionItems.get(key);
+      const cached = streamState.actionItems.get(key);
       if (cached) {
         return cached;
       }
 
       const entry = createTimelineItem("action", `Action · Step ${displayStep} · Tool #${displayIndex}`, {
-        agentRole: "main",
+        agentRole: streamState.agentRole,
+        agentLabel: streamState.agentLabel,
+        collapsible: true,
+        defaultCollapsed: true,
       });
       if (!entry) {
         return null;
@@ -867,7 +931,7 @@
       entry.body.appendChild(pre);
 
       const actionItem = { badge, pre };
-      state.activeTurn.actionItems.set(key, actionItem);
+      streamState.actionItems.set(key, actionItem);
       return actionItem;
     }
 
@@ -883,8 +947,8 @@
       return JSON.stringify(argumentsObj || {}, null, 2);
     }
 
-    function upsertAction(step, tool, argumentsObj, toolIndex) {
-      const actionItem = ensureActionItem(step, toolIndex);
+    function upsertAction(streamId, step, tool, argumentsObj, toolIndex, options = {}) {
+      const actionItem = ensureActionItem(streamId, step, toolIndex, options);
       if (!actionItem) {
         return;
       }
@@ -893,12 +957,12 @@
       scrollChatToBottom();
     }
 
-    function renderAction(step, tool, argumentsObj, toolIndex) {
-      upsertAction(step, tool, argumentsObj, toolIndex);
+    function renderAction(streamId, step, tool, argumentsObj, toolIndex, options = {}) {
+      upsertAction(streamId, step, tool, argumentsObj, toolIndex, options);
     }
 
-    function renderActionDelta(step, tool, argumentsObj, toolIndex) {
-      upsertAction(step, tool, argumentsObj, toolIndex);
+    function renderActionDelta(streamId, step, tool, argumentsObj, toolIndex, options = {}) {
+      upsertAction(streamId, step, tool, argumentsObj, toolIndex, options);
     }
 
     function formatObservation(rawContent) {
@@ -912,15 +976,16 @@
       }
     }
 
-    function ensureObservationItem(step, toolIndex) {
-      if (!state.activeTurn) {
+    function ensureObservationItem(streamId, step, toolIndex, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return null;
       }
 
       const displayStep = step || 1;
       const displayIndex = Number.isFinite(toolIndex) ? toolIndex : 0;
       const key = `${displayStep}:${displayIndex}`;
-      const cached = state.activeTurn.observationItems.get(key);
+      const cached = streamState.observationItems.get(key);
       if (cached) {
         return cached;
       }
@@ -928,7 +993,12 @@
       const entry = createTimelineItem(
         "observation",
         `Observation · Step ${displayStep} · Tool #${displayIndex}`,
-        { agentRole: "main" }
+        {
+          agentRole: streamState.agentRole,
+          agentLabel: streamState.agentLabel,
+          collapsible: true,
+          defaultCollapsed: true,
+        }
       );
       if (!entry) {
         return null;
@@ -938,15 +1008,15 @@
       entry.body.appendChild(pre);
 
       const observationItem = { pre, buffer: "", finalContent: "" };
-      state.activeTurn.observationItems.set(key, observationItem);
+      streamState.observationItems.set(key, observationItem);
       return observationItem;
     }
 
-    function appendObservationDelta(step, content, toolIndex) {
+    function appendObservationDelta(streamId, step, content, toolIndex, options = {}) {
       if (!content) {
         return;
       }
-      const observationItem = ensureObservationItem(step, toolIndex);
+      const observationItem = ensureObservationItem(streamId, step, toolIndex, options);
       if (!observationItem) {
         return;
       }
@@ -956,12 +1026,12 @@
       scrollChatToBottom();
     }
 
-    function renderObservationStart(step, content, toolIndex) {
-      appendObservationDelta(step, content || "开始执行工具。", toolIndex);
+    function renderObservationStart(streamId, step, content, toolIndex, options = {}) {
+      appendObservationDelta(streamId, step, content || "开始执行工具。", toolIndex, options);
     }
 
-    function renderObservation(step, content, toolIndex) {
-      const observationItem = ensureObservationItem(step, toolIndex);
+    function renderObservation(streamId, step, content, toolIndex, options = {}) {
+      const observationItem = ensureObservationItem(streamId, step, toolIndex, options);
       if (!observationItem) {
         return;
       }
@@ -971,29 +1041,34 @@
       scrollChatToBottom();
     }
 
-    function appendReasoningDelta(step, delta) {
-      if (!state.activeTurn || !delta) {
+    function appendReasoningDelta(streamId, step, delta, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState || !delta) {
         return;
       }
-      state.activeTurn.reasoningSteps.add(String(step));
-      appendThoughtDelta(step, delta);
+      streamState.reasoningSteps.add(String(step));
+      appendThoughtDelta(streamId, step, delta, options);
     }
 
-    function ensureFinalAnswerItem() {
-      if (!state.activeTurn) {
+    function ensureFinalAnswerItem(streamId, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return null;
       }
-      if (state.activeTurn.finalAnswerItem) {
-        // Move existing Final Answer item to the end
-        const existingItem = state.activeTurn.finalAnswerItem.item;
-        if (existingItem && existingItem.parentNode) {
+
+      if (streamState.finalAnswerItem) {
+        const existingItem = streamState.finalAnswerItem.item;
+        if (streamState.moveFinalAnswerToEnd && existingItem && existingItem.parentNode) {
           state.activeTurn.timeline.appendChild(existingItem);
         }
-        return state.activeTurn.finalAnswerItem;
+        return streamState.finalAnswerItem;
       }
 
       const entry = createTimelineItem("final-answer", "Final Answer", {
-        agentRole: "main",
+        agentRole: streamState.agentRole,
+        agentLabel: streamState.agentLabel,
+        collapsible: true,
+        defaultCollapsed: false,
       });
       if (!entry) {
         return null;
@@ -1003,38 +1078,68 @@
       content.className = "markdown-body";
       entry.body.appendChild(content);
 
-      state.activeTurn.finalAnswerItem = { content, item: entry.item };
-      return state.activeTurn.finalAnswerItem;
+      streamState.finalAnswerItem = { content, item: entry.item };
+      return streamState.finalAnswerItem;
     }
 
-    function appendAssistantMarkdown(fragment) {
-      if (!state.activeTurn) {
+    function appendAssistantMarkdown(streamId, fragment, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return;
       }
       if (fragment === null || fragment === undefined) {
         return;
       }
-      state.activeTurn.finalAnswerBuffer += fragment;
+      streamState.finalAnswerBuffer += fragment;
     }
 
-    function flushFinalAnswer() {
-      if (!state.activeTurn) {
+    function setFinalAnswerMarkdown(streamId, content, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
         return;
       }
-      const finalAnswerItem = ensureFinalAnswerItem();
+      const normalized = content || "";
+      if (!streamState.finalAnswerBuffer) {
+        streamState.finalAnswerBuffer = normalized;
+        return;
+      }
+      if (!normalized) {
+        return;
+      }
+      if (normalized === streamState.finalAnswerBuffer) {
+        return;
+      }
+      if (normalized.startsWith(streamState.finalAnswerBuffer)) {
+        streamState.finalAnswerBuffer = normalized;
+        return;
+      }
+      if (streamState.finalAnswerBuffer.startsWith(normalized)) {
+        return;
+      }
+      streamState.finalAnswerBuffer = normalized;
+    }
+
+    function flushFinalAnswer(streamId, options = {}) {
+      const streamState = getStreamState(streamId, options);
+      if (!streamState) {
+        return;
+      }
+      const finalAnswerItem = ensureFinalAnswerItem(streamId, options);
       if (!finalAnswerItem) {
         return;
       }
-      renderMarkdown(finalAnswerItem.content, state.activeTurn.finalAnswerBuffer || "");
+      renderMarkdown(finalAnswerItem.content, streamState.finalAnswerBuffer || "");
       scrollChatToBottom();
     }
 
-    function ensureDelegationItem(kind, agentRole = "main", data = {}) {
-      if (!state.activeTurn) {
+    function ensureDelegationItem(kind, streamId, agentRole = "main", data = {}) {
+      const streamState = getStreamState(streamId, { agentRole });
+      if (!streamState) {
         return null;
       }
-      const key = `${kind}:${agentRole}:${data.status || ""}:${data.relative_path || ""}`;
-      const cached = state.activeTurn.delegationItems.get(key);
+      const delegationStreamId = data.stream_id || data.sub_stream_id || "";
+      const key = `${kind}:${agentRole}:${delegationStreamId}:${data.status || ""}:${data.relative_path || ""}`;
+      const cached = streamState.delegationItems.get(key);
       if (cached) {
         return cached;
       }
@@ -1051,6 +1156,9 @@
       }
       const entry = createTimelineItem("delegation", label, {
         agentRole,
+        agentLabel: getAgentLabel(agentRole),
+        collapsible: true,
+        defaultCollapsed: true,
       });
       if (!entry) {
         return null;
@@ -1059,12 +1167,12 @@
       const pre = document.createElement("pre");
       entry.body.appendChild(pre);
       const delegationItem = { pre };
-      state.activeTurn.delegationItems.set(key, delegationItem);
+      streamState.delegationItems.set(key, delegationItem);
       return delegationItem;
     }
 
-    function renderDelegation(kind, content, agentRole = "main", data = {}) {
-      const item = ensureDelegationItem(kind, agentRole, data);
+    function renderDelegation(kind, content, streamId, agentRole = "main", data = {}) {
+      const item = ensureDelegationItem(kind, streamId, agentRole, data);
       if (!item) {
         return;
       }
@@ -1081,13 +1189,6 @@
       }
       if (data.status) {
         lines.push(`status: ${data.status}`);
-      }
-      if (data.analysis) {
-        lines.push("");
-        lines.push(data.analysis);
-      } else if (data.subagent_result) {
-        lines.push("");
-        lines.push(data.subagent_result);
       }
       item.pre.textContent = lines.join("\n");
       scrollChatToBottom();
@@ -1118,21 +1219,25 @@
         state.activeTurn.hasReceivedEvent = true;
       }
       const name = event.event;
+      const streamId = event.stream_id || "main";
+      const agentRole = event.agent_role || "main";
+      const streamOptions = { agentRole };
       if (name === "reasoning_delta") {
-        const step = state.activeTurn?.currentStep || 1;
-        appendReasoningDelta(step, event.delta || "");
+        const streamState = getStreamState(streamId, streamOptions);
+        const step = Number(event.step) || streamState?.currentStep || 1;
+        appendReasoningDelta(streamId, step, event.delta || "", streamOptions);
         return;
       }
 
       if (name === "content_delta") {
-        appendAssistantMarkdown(event.delta || "");
-        flushFinalAnswer();
+        appendAssistantMarkdown(streamId, event.delta || "", streamOptions);
+        flushFinalAnswer(streamId, streamOptions);
         return;
       }
 
       if (name === "final_answer") {
-        appendAssistantMarkdown(event.content || "");
-        flushFinalAnswer();
+        setFinalAnswerMarkdown(streamId, event.content || "", streamOptions);
+        flushFinalAnswer(streamId, streamOptions);
         return;
       }
 
@@ -1140,41 +1245,42 @@
         const step = Number(event.step) || 0;
         const toolIndexValue = Number(event.tool_index);
         const toolIndex = Number.isFinite(toolIndexValue) ? toolIndexValue : undefined;
+        const streamState = getStreamState(streamId, streamOptions);
 
         if (event.phase === "step_start") {
-          if (state.activeTurn) {
-            state.activeTurn.currentStep = step || 1;
+          if (streamState) {
+            streamState.currentStep = step || 1;
           }
           return;
         }
         if (event.phase === "thought_delta") {
-          if (!state.activeTurn?.reasoningSteps.has(String(step))) {
-            appendThoughtDelta(step, event.content || "");
+          if (!streamState?.reasoningSteps.has(String(step))) {
+            appendThoughtDelta(streamId, step, event.content || "", streamOptions);
           }
           return;
         }
         if (event.phase === "thought") {
-          renderThought(step, event.content || "");
+          renderThought(streamId, step, event.content || "", streamOptions);
           return;
         }
         if (event.phase === "action_delta") {
-          renderActionDelta(step, event.tool || "", event.arguments || {}, toolIndex);
+          renderActionDelta(streamId, step, event.tool || "", event.arguments || {}, toolIndex, streamOptions);
           return;
         }
         if (event.phase === "action") {
-          renderAction(step, event.tool || "", event.arguments || {}, toolIndex);
+          renderAction(streamId, step, event.tool || "", event.arguments || {}, toolIndex, streamOptions);
           return;
         }
         if (event.phase === "observation_start") {
-          renderObservationStart(step, event.content || "", toolIndex);
+          renderObservationStart(streamId, step, event.content || "", toolIndex, streamOptions);
           return;
         }
         if (event.phase === "observation_delta") {
-          appendObservationDelta(step, event.content || "", toolIndex);
+          appendObservationDelta(streamId, step, event.content || "", toolIndex, streamOptions);
           return;
         }
         if (event.phase === "observation") {
-          renderObservation(step, event.content || "", toolIndex);
+          renderObservation(streamId, step, event.content || "", toolIndex, streamOptions);
           return;
         }
         if (
@@ -1185,6 +1291,7 @@
           renderDelegation(
             event.phase,
             event.content || "",
+            streamId,
             event.agent_role || "main",
             event.data || {}
           );
@@ -1199,9 +1306,10 @@
       }
 
       if (name === "done") {
-        if (!state.activeTurn?.finalAnswerBuffer && state.activeTurn) {
-          appendAssistantMarkdown("模型未返回正文内容。");
-          flushFinalAnswer();
+        const mainStream = state.activeTurn?.streams.get("main");
+        if (!mainStream?.finalAnswerBuffer && state.activeTurn) {
+          appendAssistantMarkdown("main", "模型未返回正文内容。", { agentRole: "main" });
+          flushFinalAnswer("main", { agentRole: "main" });
         }
       }
     }
@@ -1277,15 +1385,20 @@
         for (const model of models) {
           const option = document.createElement("option");
           option.value = model;
-          option.textContent = model;
+          option.textContent = getModelOptionLabel(model);
           if (model === payload.current) {
             option.selected = true;
           }
           modelSelect.appendChild(option);
         }
+        modelSelect.dataset.currentModel = payload.current || models[0] || "";
+        updateModelHint(payload.current || models[0] || "");
+        return true;
       } catch (err) {
         setStatus("模型加载失败", "error");
+        modelHint.textContent = "模型预设不可用";
         appendErrorMessage(`模型信息不可用: ${err.message}`);
+        return false;
       }
     }
 
@@ -1302,6 +1415,8 @@
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.detail || payload.error || "模型切换失败");
       }
+
+      return response.json().catch(() => ({ ok: true, model }));
     }
 
     async function clearConversation() {
@@ -1338,8 +1453,10 @@
         await sendMessage(message);
 
         if (!state.activeTurn?.hasReceivedEvent) {
-          appendAssistantMarkdown("未收到服务器响应，请检查网络连接。");
-          flushFinalAnswer();
+          appendAssistantMarkdown("main", "未收到服务器响应，请检查网络连接。", {
+            agentRole: "main",
+          });
+          flushFinalAnswer("main", { agentRole: "main" });
         }
         setStatus("完成", "success");
       } catch (err) {
@@ -1359,11 +1476,19 @@
       if (state.busy) {
         return;
       }
+      const previousValue = modelSelect.dataset.currentModel || "";
       try {
         setStatus("切换模型中", "working");
-        await switchModel(modelSelect.value);
+        const payload = await switchModel(modelSelect.value);
+        const currentModel = payload.model || modelSelect.value;
+        modelSelect.dataset.currentModel = currentModel;
+        updateModelHint(currentModel);
         setStatus("模型已更新", "success");
       } catch (err) {
+        if (previousValue) {
+          modelSelect.value = previousValue;
+          updateModelHint(previousValue);
+        }
         appendErrorMessage(`模型切换失败: ${err.message}`);
         setStatus("切换失败", "error");
       }
@@ -1382,9 +1507,11 @@
     });
 
     window.addEventListener("load", async () => {
-      await refreshModels();
+      const ok = await refreshModels();
       inputBox.focus();
-      setStatus("就绪", "success");
+      if (ok) {
+        setStatus("就绪", "success");
+      }
     });
   </script>
 </body>

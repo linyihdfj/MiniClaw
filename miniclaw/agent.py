@@ -22,7 +22,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import UsageLimits
 
 from .history import save_history
-from .llm import DeepSeekClient
+from .llm import resolve_model
 from .tools import ToolRegistry
 
 
@@ -44,8 +44,8 @@ SYSTEM_PROMPT = """你是 MiniClaw，一个极简 OpenClaw 风格智能体。
 
 @dataclass
 class MiniClawAgent:
-    # 持有共享 client、工具注册表和消息历史，是主 Agent 的最小运行单元。
-    client: DeepSeekClient
+    # 持有当前模型、工具注册表和消息历史，是主 Agent 的最小运行单元。
+    model: str
     tools: ToolRegistry
     max_steps: int = 6
     messages: list[ModelMessage] | None = None
@@ -59,12 +59,17 @@ class MiniClawAgent:
         on_content_delta: Callable[[str], None] | None = None,
         on_reasoning_delta: Callable[[str], None] | None = None,
         on_trace: Callable[[dict[str, Any]], None] | None = None,
+        on_stream_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         # 每一轮都临时创建事件桥接器，把模型/工具事件转换成 CLI 和 Web 能显示的格式。
-        event_bridge = _AgentEventBridge(
+        event_bridge = AgentEventBridge(
             on_content_delta=on_content_delta,
             on_reasoning_delta=on_reasoning_delta,
             on_trace=on_trace,
+            on_stream_event=on_stream_event,
+            agent_role="main",
+            agent_name="MiniClaw",
+            stream_id="main",
         )
         agent = self._create_agent(event_bridge=event_bridge)
 
@@ -78,35 +83,47 @@ class MiniClawAgent:
             # result.all_messages() 由 pydantic-ai 维护，包含本轮新增的对话和工具消息。
             self.messages = list(result.all_messages())
             output = str(result.output or "").strip()
+            final_output = output or "".join(event_bridge.streamed_content_parts).strip()
+            if not final_output:
+                final_output = "模型没有返回可显示的内容，请稍后重试。"
+            event_bridge.emit_final_answer(final_output)
             if event_bridge.streamed_content_parts:
                 return ""
-            return output or "模型没有返回可显示的内容，请稍后重试。"
+            return final_output
         except Exception as exc:
-            return f"模型调用失败：{exc}"
+            failure = f"模型调用失败：{exc}"
+            event_bridge.emit_final_answer(failure)
+            return failure
         finally:
             save_history(self.messages or [])
 
     def reset_messages(self) -> None:
         self.messages = []
 
-    def _create_agent(self, event_bridge: "_AgentEventBridge") -> PydanticAgent[None, str]:
+    def _create_agent(self, event_bridge: "AgentEventBridge") -> PydanticAgent[None, str]:
+        model_name, model_settings = resolve_model(self.model)
         # pydantic-ai 负责真正的 function calling 循环，我们这里只装配模型、提示词和工具。
         return PydanticAgent(
-            self.client.create_model(),
+            model_name,
             output_type=str,
             system_prompt=SYSTEM_PROMPT,
             name="MiniClaw",
+            model_settings=model_settings,
             tools=self.tools.as_pydantic_tools(on_trace=event_bridge.handle_tool_event),
             end_strategy="early",
         )
 
 
 @dataclass
-class _AgentEventBridge:
+class AgentEventBridge:
     # 把底层事件流整理成“Thought / Action / Observation / Delegation”轨迹。
     on_content_delta: Callable[[str], None] | None
     on_reasoning_delta: Callable[[str], None] | None
     on_trace: Callable[[dict[str, Any]], None] | None
+    on_stream_event: Callable[[dict[str, Any]], None] | None = None
+    agent_role: str = "main"
+    agent_name: str = "MiniClaw"
+    stream_id: str = "main"
     step: int = 0
     _pending_step_start: bool = True
     _tool_index: int = 0
@@ -233,6 +250,29 @@ class _AgentEventBridge:
         self.streamed_content_parts.append(delta)
         if self.on_content_delta:
             self.on_content_delta(delta)
+        if self.on_stream_event:
+            self.on_stream_event(
+                {
+                    "event": "content_delta",
+                    "delta": delta,
+                    "agent_role": self.agent_role,
+                    "agent_name": self.agent_name,
+                    "stream_id": self.stream_id,
+                }
+            )
+
+    def emit_final_answer(self, content: str) -> None:
+        if not content or not self.on_stream_event:
+            return
+        self.on_stream_event(
+            {
+                "event": "final_answer",
+                "content": content,
+                "agent_role": self.agent_role,
+                "agent_name": self.agent_name,
+                "stream_id": self.stream_id,
+            }
+        )
 
     def _emit_thought_if_needed(self) -> None:
         if self._thought_emitted_for_step:
@@ -245,29 +285,61 @@ class _AgentEventBridge:
     def _trace(self, payload: dict[str, Any]) -> None:
         if self.on_trace:
             enriched = {
-                "agent_role": "main",
-                "agent_name": "MiniClaw",
+                "agent_role": self.agent_role,
+                "agent_name": self.agent_name,
+                "stream_id": self.stream_id,
                 **payload,
             }
             self.on_trace(enriched)
 
     def handle_tool_event(self, ctx: Any, tool_name: str, event: dict[str, Any]) -> None:
         tool_call_id = str(getattr(ctx, "tool_call_id", "") or "")
-        tool_index = self._index_for_tool_call(tool_call_id)
+        fallback_tool_index = self._index_for_tool_call(tool_call_id)
+        event_type = str(event.get("type") or "observation_delta")
         data = event.get("data") or {}
+        agent_role = str(event.get("agent_role") or data.get("agent_role") or self.agent_role)
+        agent_name = str(event.get("agent_name") or data.get("agent_name") or self.agent_name)
+        stream_id = str(event.get("stream_id") or data.get("stream_id") or self.stream_id)
+        step = self._coerce_int(event.get("step"), default=self.step)
+        tool_index = self._coerce_int(event.get("tool_index"), default=fallback_tool_index)
+        content = str(event.get("content") or "")
+        if event_type == "content_delta" and self.on_stream_event:
+            self.on_stream_event(
+                {
+                    "event": "content_delta",
+                    "delta": content,
+                    "agent_role": agent_role,
+                    "agent_name": agent_name,
+                    "stream_id": stream_id,
+                }
+            )
+            return
+        if event_type == "final_answer" and self.on_stream_event:
+            self.on_stream_event(
+                {
+                    "event": "final_answer",
+                    "content": content,
+                    "agent_role": agent_role,
+                    "agent_name": agent_name,
+                    "stream_id": stream_id,
+                }
+            )
+            return
         # 工具层可以额外上报 delegation 等高层事件，这里统一并入主时间线。
-        self._trace(
-            {
-                "step": self.step,
-                "type": str(event.get("type") or "observation_delta"),
-                "tool_index": tool_index,
-                "tool": tool_name,
-                "content": str(event.get("content") or ""),
-                "data": data,
-                "agent_role": str(data.get("agent_role") or "main"),
-                "agent_name": str(data.get("agent_name") or "MiniClaw"),
-            }
-        )
+        payload: dict[str, Any] = {
+            "step": step,
+            "type": event_type,
+            "tool_index": tool_index,
+            "tool": str(event.get("tool") or tool_name),
+            "content": content,
+            "data": data,
+            "agent_role": agent_role,
+            "agent_name": agent_name,
+            "stream_id": stream_id,
+        }
+        if "arguments" in event:
+            payload["arguments"] = event.get("arguments") or {}
+        self._trace(payload)
 
     @staticmethod
     def _partial_arguments(raw_arguments: Any) -> dict[str, Any]:
@@ -287,10 +359,17 @@ class _AgentEventBridge:
             return part.args_as_dict()
         except Exception:
             # 增量工具参数在流式阶段可能还不是完整 JSON，这里尽量保留原始片段。
-            return _AgentEventBridge._partial_arguments(part.args_as_json_str())
+            return AgentEventBridge._partial_arguments(part.args_as_json_str())
 
     @staticmethod
     def _serialize_content(content: Any) -> str:
         if isinstance(content, str):
             return content
         return json.dumps(content, ensure_ascii=False)
+
+    @staticmethod
+    def _coerce_int(raw: Any, default: int) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default

@@ -12,12 +12,11 @@ def main() -> None:
     print("Web 模式请使用：conda run -n MiniClaw uvicorn miniclaw.app:app --reload\n")
 
     try:
-        state = runtime.get_state()
+        agent = runtime.get_agent()
     except RuntimeError as exc:
         print(f"配置错误：{exc}")
         return
 
-    agent = state.agent
     if len(agent.messages) > 1:
         print(f"已加载历史对话：{len(agent.messages) - 1} 条消息。\n")
 
@@ -35,7 +34,7 @@ def main() -> None:
             return
         if user_input == "/clear":
             runtime.reset()
-            agent = runtime.get_state().agent
+            agent = runtime.get_agent()
             print("已清空对话历史。\n")
             continue
         if user_input == "/model" or user_input.startswith("/model "):
@@ -96,7 +95,7 @@ def _handle_model_command(command: str) -> None:
         print(f"可选模型：{', '.join(model_info['models'])}\n")
         return
 
-    print(f"已切换模型：{runtime.get_state().agent.client.model}\n")
+    print(f"已切换模型：{runtime.get_model_info()['current']}\n")
 
 
 def _print_trace(event: dict) -> None:
@@ -119,6 +118,12 @@ def _print_trace(event: dict) -> None:
         print(event.get("content") or "")
     elif event_type == "observation":
         print(event["content"])
+    elif event_type == "content_delta":
+        print(event.get("content") or "")
+    elif event_type == "final_answer":
+        print(f"\n[{agent_title} Final Answer]")
+        if event.get("content"):
+            print(event["content"])
     elif event_type in {"delegation_start", "delegation_progress"}:
         print(f"\n[Sub Agent Delegation]")
         print(event.get("content") or "主 Agent 正在委托子 Agent。")
@@ -135,8 +140,5 @@ def _print_trace(event: dict) -> None:
         else:
             print(f"\n[Sub Agent Result]")
         data = event.get("data") or {}
-        analysis = data.get("analysis") or data.get("subagent_result")
         if event.get("content"):
             print(event["content"])
-        if analysis:
-            print(analysis)
