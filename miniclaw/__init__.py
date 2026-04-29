@@ -1,5 +1,6 @@
-"""MiniClaw: a tiny OpenClaw-style agent framework for the homework."""
+"""MiniClaw 包的顶层导出。"""
 
 __all__ = ["__version__"]
 
+# 版本号主要用于展示和调试，不参与运行时逻辑。
 __version__ = "0.1.0"

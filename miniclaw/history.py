@@ -20,6 +20,7 @@ HISTORY_PATH = PROJECT_ROOT / "workspace" / "history.json"
 
 
 def load_history() -> list[ModelMessage]:
+    # 当前版本优先读取 pydantic-ai 的标准消息格式；旧格式则尝试迁移。
     if not HISTORY_PATH.is_file():
         return []
 
@@ -45,6 +46,7 @@ def clear_history() -> None:
 def _load_legacy_messages(raw_text: str) -> list[ModelMessage]:
     import json
 
+    # 兼容早期 OpenAI 风格的 role/content/tool_calls 存档，避免历史对话失效。
     raw_messages = json.loads(raw_text)
     if not isinstance(raw_messages, list):
         return []
@@ -89,6 +91,7 @@ def _load_legacy_messages(raw_text: str) -> list[ModelMessage]:
                 )
                 parts.append(part)
                 if tool_call_id:
+                    # 旧格式的 tool 返回只有 tool_call_id，需要先记住 tool_name 才能重建。
                     tool_name_by_id[tool_call_id] = tool_name
 
             if parts:

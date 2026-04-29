@@ -35,6 +35,8 @@ SYSTEM_PROMPT = """你是 MiniClaw，一个极简 OpenClaw 风格智能体。
 需要当前时间时，可以调用 get_current_time；需要精确数学计算时，可以调用 calculate_expression。
 需要执行 shell 时，只能调用 run_shell_command，且只用于只读命令。
 需要分析 workspace 文件时，可以调用 delegate_file_analysis 委托分析子 Agent。
+当用户要求分析、总结、解释、审查、概括 workspace 内某个文件的内容、结构、作用、逻辑、页面组成或代码行为时，你应优先调用 delegate_file_analysis，而不是自己直接分析。
+尤其是 HTML、Python、JavaScript、Markdown、TXT、配置文件等文件分析任务，默认先委托子 Agent，再基于它的结果给出最终回答。
 当你调用工具后，要根据工具返回的 Observation 继续思考并给出最终回复。
 不要尝试访问 workspace 之外的路径；如果用户要求越界操作，请说明安全限制。
 """
@@ -42,6 +44,7 @@ SYSTEM_PROMPT = """你是 MiniClaw，一个极简 OpenClaw 风格智能体。
 
 @dataclass
 class MiniClawAgent:
+    # 持有共享 client、工具注册表和消息历史，是主 Agent 的最小运行单元。
     client: DeepSeekClient
     tools: ToolRegistry
     max_steps: int = 6
@@ -57,6 +60,7 @@ class MiniClawAgent:
         on_reasoning_delta: Callable[[str], None] | None = None,
         on_trace: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        # 每一轮都临时创建事件桥接器，把模型/工具事件转换成 CLI 和 Web 能显示的格式。
         event_bridge = _AgentEventBridge(
             on_content_delta=on_content_delta,
             on_reasoning_delta=on_reasoning_delta,
@@ -71,6 +75,7 @@ class MiniClawAgent:
                 usage_limits=UsageLimits(request_limit=self.max_steps),
                 event_stream_handler=event_bridge.handle_event_stream,
             )
+            # result.all_messages() 由 pydantic-ai 维护，包含本轮新增的对话和工具消息。
             self.messages = list(result.all_messages())
             output = str(result.output or "").strip()
             if event_bridge.streamed_content_parts:
@@ -85,6 +90,7 @@ class MiniClawAgent:
         self.messages = []
 
     def _create_agent(self, event_bridge: "_AgentEventBridge") -> PydanticAgent[None, str]:
+        # pydantic-ai 负责真正的 function calling 循环，我们这里只装配模型、提示词和工具。
         return PydanticAgent(
             self.client.create_model(),
             output_type=str,
@@ -97,6 +103,7 @@ class MiniClawAgent:
 
 @dataclass
 class _AgentEventBridge:
+    # 把底层事件流整理成“Thought / Action / Observation / Delegation”轨迹。
     on_content_delta: Callable[[str], None] | None
     on_reasoning_delta: Callable[[str], None] | None
     on_trace: Callable[[dict[str, Any]], None] | None
@@ -118,6 +125,7 @@ class _AgentEventBridge:
             self._handle_event(event)
 
     def _handle_event(self, event: Any) -> None:
+        # 只要模型开始新一轮思考、增量输出或产出最终结果，就为这一轮分配 step 编号。
         if isinstance(event, PartStartEvent | PartDeltaEvent | FinalResultEvent):
             self._start_step_if_needed()
 
@@ -158,6 +166,7 @@ class _AgentEventBridge:
                     "content": self._serialize_content(event.result.content),
                 }
             )
+            # 工具执行完成后，下一次模型再输出内容时应进入新的 step。
             self._pending_step_start = True
 
     def _handle_part_start(self, event: PartStartEvent) -> None:
@@ -228,17 +237,25 @@ class _AgentEventBridge:
     def _emit_thought_if_needed(self) -> None:
         if self._thought_emitted_for_step:
             return
+        # 有些模型不会显式输出 reasoning，这里至少给 UI 一个可显示的 Thought 节点。
         content = "".join(self._current_thinking).strip() or "模型准备调用工具。"
         self._trace({"step": self.step, "type": "thought", "content": content})
         self._thought_emitted_for_step = True
 
     def _trace(self, payload: dict[str, Any]) -> None:
         if self.on_trace:
-            self.on_trace(payload)
+            enriched = {
+                "agent_role": "main",
+                "agent_name": "MiniClaw",
+                **payload,
+            }
+            self.on_trace(enriched)
 
     def handle_tool_event(self, ctx: Any, tool_name: str, event: dict[str, Any]) -> None:
         tool_call_id = str(getattr(ctx, "tool_call_id", "") or "")
         tool_index = self._index_for_tool_call(tool_call_id)
+        data = event.get("data") or {}
+        # 工具层可以额外上报 delegation 等高层事件，这里统一并入主时间线。
         self._trace(
             {
                 "step": self.step,
@@ -246,7 +263,9 @@ class _AgentEventBridge:
                 "tool_index": tool_index,
                 "tool": tool_name,
                 "content": str(event.get("content") or ""),
-                "data": event.get("data") or {},
+                "data": data,
+                "agent_role": str(data.get("agent_role") or "main"),
+                "agent_name": str(data.get("agent_name") or "MiniClaw"),
             }
         )
 
@@ -267,6 +286,7 @@ class _AgentEventBridge:
         try:
             return part.args_as_dict()
         except Exception:
+            # 增量工具参数在流式阶段可能还不是完整 JSON，这里尽量保留原始片段。
             return _AgentEventBridge._partial_arguments(part.args_as_json_str())
 
     @staticmethod

@@ -22,6 +22,7 @@ class DeepSeekClient:
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        # provider 与 http_client 会被主 Agent 和子 Agent 复用。
         self.http_client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
@@ -49,4 +50,5 @@ class DeepSeekClient:
         )
 
     def create_model(self) -> OpenAIChatModel:
+        # pydantic-ai 通过 OpenAI-compatible provider 调用 DeepSeek。
         return OpenAIChatModel(self.model, provider=self.provider)

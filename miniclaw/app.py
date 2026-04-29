@@ -21,14 +21,17 @@ WEB_DIR = PROJECT_ROOT / "web"
 
 
 class ChatRequest(BaseModel):
+    # Web 端单次提问的输入模型。
     message: str = Field(min_length=1, max_length=20000)
 
 
 class ModelRequest(BaseModel):
+    # 模型切换接口的输入模型。
     model: str
 
 
 def create_app() -> FastAPI:
+    # Web 和 CLI 共用同一份 runtime；这里仅负责 HTTP/SSE 封装。
     app = FastAPI(title="MiniClaw Web", version="0.1.0")
 
     app.add_middleware(
@@ -101,6 +104,7 @@ def create_app() -> FastAPI:
 
         def worker() -> None:
             try:
+                # 共享 turn_lock，避免 Web 和 CLI 同时修改同一段对话历史。
                 with runtime.turn_lock:
                     answer = runtime.get_state().agent.run_turn(
                         message,
@@ -124,6 +128,7 @@ def create_app() -> FastAPI:
         threading.Thread(target=worker, daemon=True).start()
 
         async def stream() -> Any:
+            # Agent 运行在线程里，SSE 响应在异步协程里消费队列并持续推送。
             while True:
                 payload = await asyncio.to_thread(event_queue.get)
                 if payload is None:
@@ -144,11 +149,14 @@ def create_app() -> FastAPI:
 
 
 def _map_trace_event(event: dict[str, Any]) -> dict[str, Any]:
+    # 前端不直接依赖 pydantic-ai 的原始事件格式，这里统一转成稳定的 UI 事件。
     phase = str(event.get("type") or "unknown")
     mapped: dict[str, Any] = {
         "event": "tao",
         "phase": phase,
         "step": int(event.get("step") or 0),
+        "agent_role": str(event.get("agent_role") or "main"),
+        "agent_name": str(event.get("agent_name") or "MiniClaw"),
     }
 
     if "tool_index" in event:
@@ -166,6 +174,9 @@ def _map_trace_event(event: dict[str, Any]) -> dict[str, Any]:
         "observation_start",
         "observation_delta",
         "observation",
+        "delegation_start",
+        "delegation_progress",
+        "delegation_result",
     }:
         mapped["content"] = str(event.get("content") or "")
         if "tool" in event:
@@ -176,4 +187,5 @@ def _map_trace_event(event: dict[str, Any]) -> dict[str, Any]:
     return mapped
 
 
+# Uvicorn 默认加载的就是这个模块级 app。
 app = create_app()

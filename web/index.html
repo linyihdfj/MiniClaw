@@ -417,6 +417,32 @@
       user-select: none;
     }
 
+    .timeline-heading {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .agent-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: #dcefe9;
+      color: #0f6b59;
+      flex-shrink: 0;
+    }
+
+    .agent-badge.sub {
+      background: #f6e2cd;
+      color: #8a4f16;
+    }
+
     .timeline-toggle {
       font-size: 14px;
       font-weight: bold;
@@ -450,6 +476,11 @@
     .timeline-item.final-answer .timeline-label {
       background: #f9f0e4;
       color: #6f4a20;
+    }
+
+    .timeline-item.delegation .timeline-label {
+      background: #f8efe3;
+      color: #8a4f16;
     }
 
     .timeline-body {
@@ -673,6 +704,7 @@
         thoughtItems: new Map(),
         actionItems: new Map(),
         observationItems: new Map(),
+        delegationItems: new Map(),
         finalAnswerItem: null,
         finalAnswerBuffer: "",
         hasReceivedEvent: false,
@@ -687,7 +719,7 @@
       state.activeTurn.placeholder = null;
     }
 
-    function createTimelineItem(kind, label) {
+    function createTimelineItem(kind, label, options = {}) {
       if (!state.activeTurn) {
         return null;
       }
@@ -700,14 +732,25 @@
       const labelContainer = document.createElement("div");
       labelContainer.className = "timeline-label";
 
+      const heading = document.createElement("span");
+      heading.className = "timeline-heading";
+
       const labelText = document.createElement("span");
       labelText.textContent = label;
+
+      const agentBadge = document.createElement("span");
+      const agentRole = options.agentRole === "sub" ? "sub" : "main";
+      agentBadge.className = `agent-badge ${agentRole === "sub" ? "sub" : ""}`.trim();
+      agentBadge.textContent = options.agentLabel || (agentRole === "sub" ? "Sub Agent" : "Main Agent");
+
+      heading.appendChild(agentBadge);
+      heading.appendChild(labelText);
 
       const toggle = document.createElement("span");
       toggle.className = "timeline-toggle";
       toggle.textContent = "▼";
 
-      labelContainer.appendChild(labelText);
+      labelContainer.appendChild(heading);
       labelContainer.appendChild(toggle);
 
       const body = document.createElement("div");
@@ -743,7 +786,9 @@
         return cached;
       }
 
-      const entry = createTimelineItem("thought", `Thought · Step ${displayStep}`);
+      const entry = createTimelineItem("thought", `Thought · Step ${displayStep}`, {
+        agentRole: "main",
+      });
       if (!entry) {
         return null;
       }
@@ -803,7 +848,9 @@
         return cached;
       }
 
-      const entry = createTimelineItem("action", `Action · Step ${displayStep} · Tool #${displayIndex}`);
+      const entry = createTimelineItem("action", `Action · Step ${displayStep} · Tool #${displayIndex}`, {
+        agentRole: "main",
+      });
       if (!entry) {
         return null;
       }
@@ -880,7 +927,8 @@
 
       const entry = createTimelineItem(
         "observation",
-        `Observation · Step ${displayStep} · Tool #${displayIndex}`
+        `Observation · Step ${displayStep} · Tool #${displayIndex}`,
+        { agentRole: "main" }
       );
       if (!entry) {
         return null;
@@ -944,7 +992,9 @@
         return state.activeTurn.finalAnswerItem;
       }
 
-      const entry = createTimelineItem("final-answer", "Final Answer");
+      const entry = createTimelineItem("final-answer", "Final Answer", {
+        agentRole: "main",
+      });
       if (!entry) {
         return null;
       }
@@ -976,6 +1026,70 @@
         return;
       }
       renderMarkdown(finalAnswerItem.content, state.activeTurn.finalAnswerBuffer || "");
+      scrollChatToBottom();
+    }
+
+    function ensureDelegationItem(kind, agentRole = "main", data = {}) {
+      if (!state.activeTurn) {
+        return null;
+      }
+      const key = `${kind}:${agentRole}:${data.status || ""}:${data.relative_path || ""}`;
+      const cached = state.activeTurn.delegationItems.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      let label = "Delegation";
+      if (kind === "delegation_start") {
+        label = "Delegation Started";
+      } else if (kind === "delegation_progress") {
+        label = "Sub Agent Running";
+      } else if (kind === "delegation_result" && agentRole === "sub") {
+        label = "Sub Agent Result";
+      } else if (kind === "delegation_result" && agentRole === "main") {
+        label = "Main Agent Resumed";
+      }
+      const entry = createTimelineItem("delegation", label, {
+        agentRole,
+      });
+      if (!entry) {
+        return null;
+      }
+
+      const pre = document.createElement("pre");
+      entry.body.appendChild(pre);
+      const delegationItem = { pre };
+      state.activeTurn.delegationItems.set(key, delegationItem);
+      return delegationItem;
+    }
+
+    function renderDelegation(kind, content, agentRole = "main", data = {}) {
+      const item = ensureDelegationItem(kind, agentRole, data);
+      if (!item) {
+        return;
+      }
+
+      const lines = [];
+      if (content) {
+        lines.push(content);
+      }
+      if (data.relative_path) {
+        lines.push(`file: ${data.relative_path}`);
+      }
+      if (data.task) {
+        lines.push(`task: ${data.task}`);
+      }
+      if (data.status) {
+        lines.push(`status: ${data.status}`);
+      }
+      if (data.analysis) {
+        lines.push("");
+        lines.push(data.analysis);
+      } else if (data.subagent_result) {
+        lines.push("");
+        lines.push(data.subagent_result);
+      }
+      item.pre.textContent = lines.join("\n");
       scrollChatToBottom();
     }
 
@@ -1061,6 +1175,19 @@
         }
         if (event.phase === "observation") {
           renderObservation(step, event.content || "", toolIndex);
+          return;
+        }
+        if (
+          event.phase === "delegation_start" ||
+          event.phase === "delegation_progress" ||
+          event.phase === "delegation_result"
+        ) {
+          renderDelegation(
+            event.phase,
+            event.content || "",
+            event.agent_role || "main",
+            event.data || {}
+          );
         }
         return;
       }

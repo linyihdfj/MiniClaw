@@ -46,6 +46,12 @@ hookspec = pluggy.HookspecMarker("miniclaw")
 hookimpl = pluggy.HookimplMarker("miniclaw")
 _SHELL_COMMANDS = {"pwd", "ls", "cat", "head", "tail", "wc", "rg"}
 _SHELL_META_CHARS = {"|", "&", ";", "<", ">", "`", "$", "(", ")", "{", "}"}
+_MAX_SHELL_ARGS = 8
+_MAX_SHELL_ARG_LENGTH = 200
+_MAX_SHELL_FILES = 3
+_MAX_RG_PATTERN_LENGTH = 120
+_MAX_HEAD_TAIL_LINES = 200
+_SHELL_POLICY_VERSION = "read-only-sandbox-v2"
 _MAX_SHELL_OUTPUT = 4000
 _MAX_FILE_READ_BYTES = 1_000_000
 _MAX_WEB_BYTES = 1_500_000
@@ -387,7 +393,7 @@ def register_delegate_tool(registry: ToolRegistry, client: Any) -> None:
     registry.register(
         Tool(
             name="delegate_file_analysis",
-            description="将 workspace 文件分析任务委托给只读分析子 Agent。",
+            description="将 workspace 文件分析任务委托给只读分析子 Agent。凡是分析、总结、解释、审查文件内容或结构的任务，都应优先使用这个工具。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -795,6 +801,8 @@ def run_shell_command(
         "command": command,
         "args": command_args,
         "working_dir": working_dir,
+        "validated": True,
+        "policy": _SHELL_POLICY_VERSION,
         "returncode": completed.returncode,
         "stdout": stdout,
         "stderr": stderr,
@@ -1161,25 +1169,66 @@ def _make_delegate_file_analysis(client: Any) -> ToolFunction:
     def delegate_file_analysis(relative_path: str, task: str) -> dict[str, Any]:
         from .subagents import AnalysisSubAgent
 
-        analysis = AnalysisSubAgent(client).analyze(relative_path=relative_path, task=task)
+        emit_tool_event(
+            "delegation_start",
+            f"主 Agent 准备把文件分析任务委托给子 Agent：{relative_path}",
+            {
+                "relative_path": relative_path,
+                "task": task,
+                "status": "delegation_started",
+                "agent_role": "main",
+                "agent_name": "MiniClaw",
+            },
+        )
+        subagent = AnalysisSubAgent(client)
+        analysis = subagent.analyze(
+            relative_path=relative_path,
+            task=task,
+            on_event=lambda event: emit_tool_event(
+                str(event.get("type") or "delegation_progress"),
+                str(event.get("content") or ""),
+                event.get("data") or {},
+            ),
+        )
+        emit_tool_event(
+            "delegation_result",
+            "子 Agent 已返回分析结果，主 Agent 恢复处理。",
+            {
+                "relative_path": relative_path,
+                "task": task,
+                "status": "delegation_completed",
+                "agent_role": "main",
+                "agent_name": "MiniClaw",
+                "subagent_result": analysis,
+            },
+        )
         return {
             "relative_path": relative_path,
             "task": task,
             "analysis": analysis,
+            "agent_role": "sub",
+            "agent_name": "AnalysisSubAgent",
+            "phase": "subagent_result",
         }
 
     return delegate_file_analysis
 
 
 def _validate_shell_command(command: str, args: list[str]) -> list[str]:
-    _reject_shell_syntax(command)
+    if not isinstance(command, str):
+        raise ToolError("command 必须是字符串。")
+    _reject_shell_syntax(command, field_name="command")
     if command not in _SHELL_COMMANDS:
         raise ToolError(f"不允许执行命令：{command}")
     if not isinstance(args, list):
         raise ToolError("args 必须是字符串数组。")
+    if len(args) > _MAX_SHELL_ARGS:
+        raise ToolError(f"参数数量超限：最多允许 {_MAX_SHELL_ARGS} 个参数。")
 
     for arg in args:
-        _reject_shell_syntax(arg)
+        if not isinstance(arg, str):
+            raise ToolError("args 必须是字符串数组。")
+        _reject_shell_syntax(arg, field_name="参数")
 
     validators = {
         "pwd": _validate_pwd_args,
@@ -1193,11 +1242,17 @@ def _validate_shell_command(command: str, args: list[str]) -> list[str]:
     return validators[command](args)
 
 
-def _reject_shell_syntax(value: str) -> None:
+def _reject_shell_syntax(value: str, field_name: str = "shell 参数") -> None:
+    if value != value.strip():
+        raise ToolError(f"{field_name} 不允许包含前后空白。")
+    if not value:
+        raise ToolError(f"{field_name} 不能为空。")
+    if len(value) > _MAX_SHELL_ARG_LENGTH:
+        raise ToolError(f"{field_name} 过长，最多允许 {_MAX_SHELL_ARG_LENGTH} 个字符。")
     if "\n" in value or "\x00" in value:
-        raise ToolError("shell 参数不允许包含换行或 NUL 字符。")
+        raise ToolError(f"{field_name} 不允许包含换行或 NUL 字符。")
     if any(char in value for char in _SHELL_META_CHARS):
-        raise ToolError(f"shell 参数包含不允许的语法字符：{value}")
+        raise ToolError(f"{field_name} 包含不允许的语法字符：{value}")
 
 
 def _validate_pwd_args(args: list[str]) -> list[str]:
@@ -1208,13 +1263,27 @@ def _validate_pwd_args(args: list[str]) -> list[str]:
 
 def _validate_ls_args(args: list[str]) -> list[str]:
     allowed_flags = {"-l", "-a", "-la", "-al"}
-    return _validate_flags_and_paths(args, allowed_flags, allow_directory=True)
+    result: list[str] = []
+    path_count = 0
+    for arg in args:
+        if arg.startswith("-"):
+            if arg not in allowed_flags:
+                raise ToolError(f"ls 不允许的参数：{arg}")
+            result.append(arg)
+            continue
+        path_count += 1
+        if path_count > 1:
+            raise ToolError("ls 最多只允许一个目录路径。")
+        result.append(_validate_dir_arg(arg))
+    return result
 
 
 def _validate_cat_args(args: list[str]) -> list[str]:
     if not args:
         raise ToolError("cat 需要至少一个 workspace 内文件路径。")
-    return [_validate_file_arg(arg) for arg in args]
+    if len(args) > _MAX_SHELL_FILES:
+        raise ToolError(f"cat 最多只允许 {_MAX_SHELL_FILES} 个文件。")
+    return [_validate_file_arg(arg, command_name="cat") for arg in args]
 
 
 def _validate_head_tail_args(args: list[str]) -> list[str]:
@@ -1222,20 +1291,33 @@ def _validate_head_tail_args(args: list[str]) -> list[str]:
     index = 0
     if len(args) >= 2 and args[0] == "-n":
         if not args[1].isdigit():
-            raise ToolError("-n 后必须是数字。")
+            raise ToolError("-n 后必须是正整数。")
+        line_count = int(args[1])
+        if line_count < 1 or line_count > _MAX_HEAD_TAIL_LINES:
+            raise ToolError(f"-n 取值超限：只允许 1 到 {_MAX_HEAD_TAIL_LINES}。")
         result.extend(args[:2])
         index = 2
+    elif args and args[0].startswith("-"):
+        raise ToolError("head/tail 仅允许可选参数 -n <数字>。")
 
     paths = args[index:]
     if not paths:
         raise ToolError("head/tail 需要至少一个 workspace 内文件路径。")
-    result.extend(_validate_file_arg(path) for path in paths)
+    if len(paths) > _MAX_SHELL_FILES:
+        raise ToolError(f"head/tail 最多只允许 {_MAX_SHELL_FILES} 个文件。")
+    result.extend(_validate_file_arg(path, command_name="head/tail") for path in paths)
     return result
 
 
 def _validate_wc_args(args: list[str]) -> list[str]:
     allowed_flags = {"-l", "-w", "-c"}
-    return _validate_flags_and_paths(args, allowed_flags, allow_directory=False)
+    files = _validate_flags_and_paths(args, allowed_flags, allow_directory=False, command_name="wc")
+    path_count = len([arg for arg in files if not arg.startswith("-")])
+    if path_count == 0:
+        raise ToolError("wc 需要至少一个 workspace 内文件路径。")
+    if path_count > _MAX_SHELL_FILES:
+        raise ToolError(f"wc 最多只允许 {_MAX_SHELL_FILES} 个文件。")
+    return files
 
 
 def _validate_rg_args(args: list[str]) -> list[str]:
@@ -1248,6 +1330,10 @@ def _validate_rg_args(args: list[str]) -> list[str]:
         raise ToolError("rg 需要搜索 pattern。")
 
     pattern = rest.pop(0)
+    if not pattern.strip():
+        raise ToolError("rg 的 pattern 不能为空。")
+    if len(pattern) > _MAX_RG_PATTERN_LENGTH:
+        raise ToolError(f"rg 的 pattern 过长，最多允许 {_MAX_RG_PATTERN_LENGTH} 个字符。")
     if rest:
         if len(rest) > 1:
             raise ToolError("rg 只允许一个可选搜索目录。")
@@ -1260,23 +1346,32 @@ def _validate_flags_and_paths(
     args: list[str],
     allowed_flags: set[str],
     allow_directory: bool,
+    command_name: str,
 ) -> list[str]:
     result: list[str] = []
     for arg in args:
         if arg.startswith("-"):
             if arg not in allowed_flags:
-                raise ToolError(f"不允许的参数：{arg}")
+                raise ToolError(f"{command_name} 不允许的参数：{arg}")
             result.append(arg)
             continue
 
-        result.append(_validate_dir_arg(arg) if allow_directory else _validate_file_arg(arg))
+        result.append(
+            _validate_dir_arg(arg)
+            if allow_directory
+            else _validate_file_arg(arg, command_name=command_name)
+        )
     return result
 
 
-def _validate_file_arg(arg: str) -> str:
+def _validate_file_arg(arg: str, command_name: str = "命令") -> str:
+    if arg.startswith("-"):
+        raise ToolError(f"{command_name} 不允许使用以 - 开头的伪路径参数：{arg}")
     path = _safe_workspace_path(arg)
     if not path.is_file():
         raise ToolError(f"不是 workspace 内文件：{arg}")
+    if path.stat().st_size > _MAX_FILE_READ_BYTES:
+        raise ToolError(f"文件过大，拒绝通过 {command_name} 读取：{arg}")
     return arg
 
 

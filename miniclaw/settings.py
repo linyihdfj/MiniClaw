@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DeepSeekSettings(BaseSettings):
+    # BaseSettings 会自动从 .env 和环境变量加载字段。
     api_key: str = Field(alias="DEEPSEEK_API_KEY")
     base_url: str = Field(
         default="https://api.deepseek.com/beta",
@@ -20,6 +21,7 @@ class DeepSeekSettings(BaseSettings):
 
 
 class SerpApiSettings(BaseSettings):
+    # 联网搜索相关配置单独拆开，避免没有 SERPAPI_KEY 时影响主模型启动。
     api_key: str = Field(alias="SERPAPI_KEY")
     location: str = Field(
         default="Austin, Texas, United States",

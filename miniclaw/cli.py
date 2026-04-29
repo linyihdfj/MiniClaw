@@ -6,6 +6,7 @@ from .runtime import RuntimeError, runtime
 
 
 def main() -> None:
+    # CLI 与 Web 共用 runtime；这里主要负责读取输入并打印流式结果。
     print("MiniClaw - Python 智能体作业 2")
     print("输入 /quit 退出，输入 /model 查看或切换模型，输入 /clear 清空历史。")
     print("Web 模式请使用：conda run -n MiniClaw uvicorn miniclaw.app:app --reload\n")
@@ -78,6 +79,7 @@ def main() -> None:
 
 
 def _handle_model_command(command: str) -> None:
+    # `/model` 既能查看当前模型，也能切换到另一个预设模型。
     parts = command.split()
     if len(parts) == 1:
         model_info = runtime.get_model_info()
@@ -94,23 +96,47 @@ def _handle_model_command(command: str) -> None:
         print(f"可选模型：{', '.join(model_info['models'])}\n")
         return
 
-    print(f"已切换模型：{runtime.get_state().client.model}\n")
+    print(f"已切换模型：{runtime.get_state().agent.client.model}\n")
 
 
 def _print_trace(event: dict) -> None:
+    # 把结构化 trace 事件转成老师演示时更容易看的终端分段。
     step = event["step"]
     event_type = event["type"]
+    agent_role = str(event.get("agent_role") or "main")
+    agent_title = "Main Agent" if agent_role == "main" else "Sub Agent"
     if event_type == "thought":
-        print(f"\n[Step {step} Thought]")
+        print(f"\n[{agent_title} · Step {step} Thought]")
         print(event["content"])
     elif event_type == "action":
-        print(f"\n[Step {step} Action]")
+        print(f"\n[{agent_title} · Step {step} Action]")
         arguments = json.dumps(event["arguments"], ensure_ascii=False)
         print(f"{event['tool']}({arguments})")
     elif event_type == "observation_start":
-        print(f"\n[Step {step} Observation]")
+        print(f"\n[{agent_title} · Step {step} Observation]")
         print(event.get("content") or "开始执行工具。")
     elif event_type == "observation_delta":
         print(event.get("content") or "")
     elif event_type == "observation":
         print(event["content"])
+    elif event_type in {"delegation_start", "delegation_progress"}:
+        print(f"\n[Sub Agent Delegation]")
+        print(event.get("content") or "主 Agent 正在委托子 Agent。")
+        data = event.get("data") or {}
+        relative_path = data.get("relative_path")
+        task = data.get("task")
+        if relative_path:
+            print(f"文件: {relative_path}")
+        if task:
+            print(f"任务: {task}")
+    elif event_type == "delegation_result":
+        if agent_role == "main":
+            print(f"\n[Main Agent Resumed]")
+        else:
+            print(f"\n[Sub Agent Result]")
+        data = event.get("data") or {}
+        analysis = data.get("analysis") or data.get("subagent_result")
+        if event.get("content"):
+            print(event["content"])
+        if analysis:
+            print(analysis)

@@ -18,7 +18,7 @@ class RuntimeError(Exception):
 
 @dataclass
 class RuntimeState:
-    client: DeepSeekClient
+    # 共享运行时只保留主 Agent，client 已经包含在 Agent 里。
     agent: MiniClawAgent
 
 
@@ -27,6 +27,7 @@ class RuntimeManager:
         self._state: RuntimeState | None = None
         self._boot_error: str | None = None
         self._state_lock = threading.Lock()
+        # turn_lock 用来串行化每一轮对话，避免并发修改 messages/history。
         self.turn_lock = threading.Lock()
 
     def get_state(self) -> RuntimeState:
@@ -36,7 +37,7 @@ class RuntimeManager:
     def get_model_info(self) -> dict[str, object]:
         state = self.get_state()
         return {
-            "current": state.client.model,
+            "current": state.agent.client.model,
             "models": list(MODELS),
         }
 
@@ -46,8 +47,8 @@ class RuntimeManager:
 
         with self.turn_lock:
             state = self.get_state()
-            state.client.model = model
-            return state.client.model
+            state.agent.client.model = model
+            return state.agent.client.model
 
     def reset(self) -> None:
         with self.turn_lock:
@@ -56,6 +57,7 @@ class RuntimeManager:
             clear_history()
 
     def _ensure_state_locked(self) -> RuntimeState:
+        # 懒加载 runtime，CLI 和 Web 首次访问时才真正初始化模型与工具。
         if self._boot_error:
             raise RuntimeError(self._boot_error)
 
@@ -74,8 +76,9 @@ class RuntimeManager:
             tools=create_default_registry(client=client),
             messages=history or None,
         )
-        self._state = RuntimeState(client=client, agent=agent)
+        self._state = RuntimeState(agent=agent)
         return self._state
 
 
+# 模块级单例，整个进程只维护一份共享 runtime。
 runtime = RuntimeManager()
