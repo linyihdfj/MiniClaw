@@ -410,6 +410,26 @@
       color: #1f3550;
       letter-spacing: 0.05em;
       text-transform: uppercase;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .timeline-toggle {
+      font-size: 14px;
+      font-weight: bold;
+      color: #5f6f80;
+      transition: transform 200ms ease;
+    }
+
+    .timeline-item.collapsed .timeline-body {
+      display: none;
+    }
+
+    .timeline-item.collapsed .timeline-toggle {
+      transform: rotate(-90deg);
     }
 
     .timeline-item.thought .timeline-label {
@@ -550,6 +570,17 @@
       activeTurn: null,
     };
 
+    const apiBase = (() => {
+      if (window.location && window.location.origin && window.location.origin !== "null") {
+        return window.location.origin;
+      }
+      return "http://127.0.0.1:8000";
+    })();
+
+    function apiUrl(path) {
+      return `${apiBase}${path}`;
+    }
+
     function setStatus(text, tone) {
       statusText.textContent = text;
       statusPill.classList.remove("working", "success", "error");
@@ -644,6 +675,7 @@
         observationItems: new Map(),
         finalAnswerItem: null,
         finalAnswerBuffer: "",
+        hasReceivedEvent: false,
       };
     }
 
@@ -665,19 +697,38 @@
       const item = document.createElement("section");
       item.className = `timeline-item ${kind}`;
 
-      const labelEl = document.createElement("div");
-      labelEl.className = "timeline-label";
-      labelEl.textContent = label;
+      const labelContainer = document.createElement("div");
+      labelContainer.className = "timeline-label";
+
+      const labelText = document.createElement("span");
+      labelText.textContent = label;
+
+      const toggle = document.createElement("span");
+      toggle.className = "timeline-toggle";
+      toggle.textContent = "▼";
+
+      labelContainer.appendChild(labelText);
+      labelContainer.appendChild(toggle);
 
       const body = document.createElement("div");
       body.className = "timeline-body";
 
-      item.appendChild(labelEl);
+      // Add click handler for toggle
+      const isTaoItem = kind === "thought" || kind === "action" || kind === "observation";
+      if (isTaoItem) {
+        item.classList.add("collapsed");
+        labelContainer.addEventListener("click", (e) => {
+          e.stopPropagation();
+          item.classList.toggle("collapsed");
+        });
+      }
+
+      item.appendChild(labelContainer);
       item.appendChild(body);
       state.activeTurn.timeline.appendChild(item);
       scrollChatToBottom();
 
-      return { item, body, labelEl };
+      return { item, body, labelEl: labelContainer };
     }
 
     function ensureThoughtItem(step) {
@@ -885,6 +936,11 @@
         return null;
       }
       if (state.activeTurn.finalAnswerItem) {
+        // Move existing Final Answer item to the end
+        const existingItem = state.activeTurn.finalAnswerItem.item;
+        if (existingItem && existingItem.parentNode) {
+          state.activeTurn.timeline.appendChild(existingItem);
+        }
         return state.activeTurn.finalAnswerItem;
       }
 
@@ -897,21 +953,29 @@
       content.className = "markdown-body";
       entry.body.appendChild(content);
 
-      state.activeTurn.finalAnswerItem = { content };
+      state.activeTurn.finalAnswerItem = { content, item: entry.item };
       return state.activeTurn.finalAnswerItem;
     }
 
     function appendAssistantMarkdown(fragment) {
-      if (!fragment || !state.activeTurn) {
+      if (!state.activeTurn) {
+        return;
+      }
+      if (fragment === null || fragment === undefined) {
+        return;
+      }
+      state.activeTurn.finalAnswerBuffer += fragment;
+    }
+
+    function flushFinalAnswer() {
+      if (!state.activeTurn) {
         return;
       }
       const finalAnswerItem = ensureFinalAnswerItem();
       if (!finalAnswerItem) {
         return;
       }
-
-      state.activeTurn.finalAnswerBuffer += fragment;
-      renderMarkdown(finalAnswerItem.content, state.activeTurn.finalAnswerBuffer);
+      renderMarkdown(finalAnswerItem.content, state.activeTurn.finalAnswerBuffer || "");
       scrollChatToBottom();
     }
 
@@ -936,6 +1000,9 @@
     }
 
     function handleEvent(event) {
+      if (state.activeTurn) {
+        state.activeTurn.hasReceivedEvent = true;
+      }
       const name = event.event;
       if (name === "reasoning_delta") {
         const step = state.activeTurn?.currentStep || 1;
@@ -945,11 +1012,13 @@
 
       if (name === "content_delta") {
         appendAssistantMarkdown(event.delta || "");
+        flushFinalAnswer();
         return;
       }
 
       if (name === "final_answer") {
         appendAssistantMarkdown(event.content || "");
+        flushFinalAnswer();
         return;
       }
 
@@ -999,6 +1068,14 @@
       if (name === "error") {
         appendErrorMessage(`服务错误: ${event.message || "未知错误"}`);
         setStatus("出错", "error");
+        return;
+      }
+
+      if (name === "done") {
+        if (!state.activeTurn?.finalAnswerBuffer && state.activeTurn) {
+          appendAssistantMarkdown("模型未返回正文内容。");
+          flushFinalAnswer();
+        }
       }
     }
 
@@ -1017,7 +1094,7 @@
           break;
         }
 
-        pending += decoder.decode(value, { stream: true });
+        pending += decoder.decode(value, { stream: true }).replaceAll("\r", "");
         let splitIndex = pending.indexOf("\n\n");
 
         while (splitIndex !== -1) {
@@ -1044,7 +1121,7 @@
     }
 
     async function sendMessage(message) {
-      const response = await fetch("/api/chat/stream", {
+      const response = await fetch(apiUrl("/api/chat/stream"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1062,7 +1139,7 @@
 
     async function refreshModels() {
       try {
-        const response = await fetch("/api/models");
+        const response = await fetch(apiUrl("/api/models"));
         const payload = await response.json();
         if (!response.ok || !payload.ok) {
           throw new Error(payload.error || "模型查询失败");
@@ -1086,7 +1163,7 @@
     }
 
     async function switchModel(model) {
-      const response = await fetch("/api/model", {
+      const response = await fetch(apiUrl("/api/model"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1101,7 +1178,7 @@
     }
 
     async function clearConversation() {
-      const response = await fetch("/api/clear", { method: "POST" });
+      const response = await fetch(apiUrl("/api/clear"), { method: "POST" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok || !payload.ok) {
         throw new Error(payload.error || "清空失败");
@@ -1133,8 +1210,9 @@
       try {
         await sendMessage(message);
 
-        if (!state.activeTurn?.finalAnswerBuffer && state.activeTurn) {
-          appendAssistantMarkdown("模型未返回正文内容。");
+        if (!state.activeTurn?.hasReceivedEvent) {
+          appendAssistantMarkdown("未收到服务器响应，请检查网络连接。");
+          flushFinalAnswer();
         }
         setStatus("完成", "success");
       } catch (err) {

@@ -5,6 +5,7 @@ import ast
 import contextvars
 import datetime as dt
 import html
+import inspect
 import ipaddress
 import json
 import math
@@ -15,11 +16,19 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from xml.etree import ElementTree
+
+import httpx
+import pluggy
+import serpapi
+import trafilatura
+from pydantic import ValidationError
+from trafilatura.metadata import extract_metadata
+from pydantic_ai.tools import RunContext
+from pydantic_ai.tools import Tool as PydanticTool
+
+from .settings import SerpApiSettings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,11 +37,13 @@ PLUGINS_DIR = PROJECT_ROOT / "tools_plugins"
 
 ToolFunction = Callable[..., dict[str, Any]]
 ToolEventCallback = Callable[[dict[str, Any]], None]
-_PLUGIN_TOOLS: list["Tool"] = []
 _LOADED_PLUGIN_FILES: set[Path] = set()
+_LOADED_PLUGIN_MODULES: dict[Path, Any] = {}
 _TOOL_EVENT_CALLBACK: contextvars.ContextVar[ToolEventCallback | None] = (
     contextvars.ContextVar("miniclaw_tool_event_callback", default=None)
 )
+hookspec = pluggy.HookspecMarker("miniclaw")
+hookimpl = pluggy.HookimplMarker("miniclaw")
 _SHELL_COMMANDS = {"pwd", "ls", "cat", "head", "tail", "wc", "rg"}
 _SHELL_META_CHARS = {"|", "&", ";", "<", ">", "`", "$", "(", ")", "{", "}"}
 _MAX_SHELL_OUTPUT = 4000
@@ -46,6 +57,12 @@ _USER_AGENT = "MiniClaw/0.2 (+https://example.local)"
 
 class ToolError(Exception):
     """Raised for safe, user-facing tool errors."""
+
+
+class PluginSpec:
+    @hookspec
+    def register_tools(self) -> list["Tool"]:
+        """Return plugin tool definitions."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +83,51 @@ class Tool:
             },
         }
 
+    def as_pydantic_tool(
+        self,
+        on_trace: Callable[[RunContext[Any], str, dict[str, Any]], None] | None = None,
+    ) -> PydanticTool[Any]:
+        function = self.function
+        original_signature = inspect.signature(function)
+
+        def wrapped(ctx: RunContext[Any], **kwargs: Any) -> dict[str, Any]:
+            callback = None
+            if on_trace:
+                callback = lambda event: on_trace(ctx, self.name, event)
+            token = _TOOL_EVENT_CALLBACK.set(callback)
+            try:
+                return function(**kwargs)
+            except TypeError as exc:
+                return {"ok": False, "tool": self.name, "error": f"工具参数错误：{exc}"}
+            except ToolError as exc:
+                return {"ok": False, "tool": self.name, "error": str(exc)}
+            except Exception as exc:
+                return {"ok": False, "tool": self.name, "error": f"工具执行异常：{exc}"}
+            finally:
+                _TOOL_EVENT_CALLBACK.reset(token)
+
+        wrapped.__name__ = function.__name__
+        wrapped.__doc__ = self.description
+        wrapped.__annotations__ = {"ctx": RunContext[Any], **getattr(function, "__annotations__", {})}
+        wrapped.__signature__ = original_signature.replace(
+            parameters=[
+                inspect.Parameter(
+                    "ctx",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=RunContext[Any],
+                ),
+                *original_signature.parameters.values(),
+            ]
+        )
+
+        return PydanticTool(
+            wrapped,
+            takes_ctx=True,
+            name=self.name,
+            description=self.description,
+            strict=True,
+        )
+
 
 class ToolRegistry:
     def __init__(self) -> None:
@@ -76,6 +138,12 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema() for tool in self._tools.values()]
+
+    def as_pydantic_tools(
+        self,
+        on_trace: Callable[[RunContext[Any], str, dict[str, Any]], None] | None = None,
+    ) -> list[PydanticTool[Any]]:
+        return [tool.as_pydantic_tool(on_trace=on_trace) for tool in self._tools.values()]
 
     def run(
         self,
@@ -342,7 +410,7 @@ def register_web_tools(registry: ToolRegistry) -> None:
     registry.register(
         Tool(
             name="search_web",
-            description="使用 Bing、Baidu、Google 联网搜索公开网页信息，支持限定站点和指定返回数量。",
+            description="使用 SerpAPI 的 Google 搜索联网检索公开网页信息，支持限定站点和指定返回数量。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -438,15 +506,12 @@ def tool(
     parameters: dict[str, Any],
 ) -> Callable[[ToolFunction], ToolFunction]:
     def decorator(function: ToolFunction) -> ToolFunction:
-        _PLUGIN_TOOLS.append(
-            Tool(
-                name=name,
-                description=description,
-                parameters=parameters,
-                function=function,
-            )
+        return Tool(
+            name=name,
+            description=description,
+            parameters=parameters,
+            function=function,
         )
-        return function
 
     return decorator
 
@@ -473,19 +538,29 @@ def load_plugins(registry: ToolRegistry, plugins_dir: Path = PLUGINS_DIR) -> Non
     if not plugins_dir.is_dir():
         return
 
+    manager = pluggy.PluginManager("miniclaw")
+    manager.add_hookspecs(PluginSpec)
+
     for plugin_path in sorted(plugins_dir.glob("*.py")):
-        if plugin_path.name == "__init__.py" or plugin_path in _LOADED_PLUGIN_FILES:
+        if plugin_path.name == "__init__.py":
             continue
 
         module_name = f"miniclaw_plugin_{plugin_path.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, plugin_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        _LOADED_PLUGIN_FILES.add(plugin_path)
+        if plugin_path in _LOADED_PLUGIN_MODULES:
+            module = _LOADED_PLUGIN_MODULES[plugin_path]
+        else:
+            spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            _LOADED_PLUGIN_FILES.add(plugin_path)
+            _LOADED_PLUGIN_MODULES[plugin_path] = module
 
-    for plugin_tool in _PLUGIN_TOOLS:
-        registry.register(plugin_tool)
+        manager.register(module, name=module_name)
+
+    for plugin_tools in manager.hook.register_tools():
+        for plugin_tool in plugin_tools or []:
+            registry.register(plugin_tool)
 
 
 def list_files(relative_dir: str = ".") -> dict[str, Any]:
@@ -739,56 +814,77 @@ def search_web(query: str, max_results: int = _DEFAULT_SEARCH_RESULTS, site: str
     )
     site = site.strip()
     search_query = f"site:{site} {normalized_query}" if site else normalized_query
+    settings = _load_serpapi_settings()
+    params: dict[str, Any] = {
+        "engine": "google",
+        "q": search_query,
+        "num": limit,
+        "google_domain": settings.google_domain,
+        "hl": settings.hl,
+        "gl": settings.gl,
+    }
+    if settings.location:
+        params["location"] = settings.location
 
-    engines: list[tuple[str, Callable[[str, int], list[dict[str, str]]]]] = [
-        ("bing", _search_bing),
-        ("baidu", _search_baidu),
-        ("google", _search_google),
-    ]
-    all_results: list[dict[str, str]] = []
-    errors: dict[str, str] = {}
-
-    for engine_name, search_function in engines:
-        emit_tool_event(
-            "observation_delta",
-            f"正在搜索 {engine_name}...",
-            {"engine": engine_name, "status": "started"},
-        )
-        try:
-            engine_results = search_function(search_query, limit)
-        except Exception as exc:
-            errors[engine_name] = str(exc)
-            emit_tool_event(
-                "observation_delta",
-                f"{engine_name} 搜索失败：{exc}",
-                {"engine": engine_name, "status": "error", "error": str(exc)},
-            )
-            continue
-
-        all_results.extend(engine_results)
-        emit_tool_event(
-            "observation_delta",
-            f"{engine_name} 返回 {len(engine_results)} 条候选结果。",
-            {"engine": engine_name, "status": "ok", "count": len(engine_results)},
-        )
-
-    results = _dedupe_search_results(
-        all_results
+    emit_tool_event(
+        "observation_delta",
+        "正在通过 SerpAPI 搜索 Google...",
+        {"provider": "serpapi", "engine": "google", "status": "started"},
     )
+    client = serpapi.Client(api_key=settings.api_key, timeout=settings.timeout)
+    try:
+        response = client.search(params)
+    except serpapi.HTTPError as exc:
+        raise ToolError(f"SerpAPI 搜索失败：HTTP {exc.status_code} {exc.error}") from exc
+    except serpapi.TimeoutError as exc:
+        raise ToolError(f"SerpAPI 搜索超时：{exc}") from exc
+    except Exception as exc:
+        raise ToolError(f"SerpAPI 搜索失败：{exc}") from exc
+
+    response_error = _clean_search_text(str(response.get("error") or ""))
+    if response_error:
+        raise ToolError(f"SerpAPI 搜索失败：{response_error}")
+
+    organic_results = response.get("organic_results") or []
+    results: list[dict[str, str]] = []
+    for item in organic_results:
+        title = _clean_search_text(item.get("title"))
+        result_url = str(item.get("link") or "").strip()
+        snippet = _clean_search_text(item.get("snippet"))
+        displayed_link = _clean_search_text(item.get("displayed_link"))
+        if not title or not result_url:
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": result_url,
+                "snippet": snippet,
+                "source": displayed_link or "google",
+            }
+        )
+
+    results = _dedupe_search_results(results)
     if site:
         results = [result for result in results if _url_matches_site(result.get("url", ""), site)]
     results = results[:limit]
 
+    emit_tool_event(
+        "observation_delta",
+        f"SerpAPI 返回 {len(results)} 条结果。",
+        {"provider": "serpapi", "engine": "google", "status": "ok", "count": len(results)},
+    )
+
     if not results:
-        if errors:
-            raise ToolError(f"没有找到搜索结果。搜索错误：{errors}")
         raise ToolError("没有找到搜索结果。")
 
     return {
         "query": normalized_query,
         "site": site,
-        "engines": [engine_name for engine_name, _ in engines],
-        "errors": errors,
+        "provider": "serpapi",
+        "engines": ["google"],
+        "search_metadata": {
+            "id": str((response.get("search_metadata") or {}).get("id") or ""),
+        },
         "results": results,
     }
 
@@ -796,41 +892,48 @@ def search_web(query: str, max_results: int = _DEFAULT_SEARCH_RESULTS, site: str
 def fetch_web_page(url: str, max_chars: int = _MAX_WEB_TEXT) -> dict[str, Any]:
     safe_url = _validate_public_url(url)
     limit = _clamp_int(max_chars, minimum=500, maximum=_MAX_WEB_TEXT, default=6000)
-    request = Request(
-        safe_url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5",
-        },
-    )
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5",
+    }
 
     try:
-        opener = build_opener(_PublicRedirectHandler)
-        with opener.open(request, timeout=12) as response:
-            content_type = response.headers.get("Content-Type", "")
-            payload = response.read(_MAX_WEB_BYTES + 1)
-            final_url = response.geturl()
-    except HTTPError as exc:
-        raise ToolError(f"网页抓取失败：HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ToolError(f"网页抓取失败：{exc.reason}") from exc
-    except TimeoutError as exc:
-        raise ToolError("网页抓取超时，请稍后重试。") from exc
-
-    if len(payload) > _MAX_WEB_BYTES:
-        raise ToolError("网页过大，已拒绝抓取。")
+        final_url, content_type, payload = _fetch_public_payload(
+            safe_url,
+            headers=headers,
+            timeout=12,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise ToolError(f"网页抓取失败：HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise ToolError(f"网页抓取失败：{exc}") from exc
 
     encoding = _guess_encoding(content_type)
     text = payload.decode(encoding, errors="replace")
-    title, body_text, links = _extract_web_text(text, final_url)
-    truncated = len(body_text) > limit
+    metadata = extract_metadata(text, default_url=final_url)
+    title = _clean_search_text(getattr(metadata, "title", None))
+    body_text = (
+        trafilatura.extract(
+            text,
+            url=final_url,
+            include_comments=False,
+            include_links=False,
+            include_images=False,
+            include_formatting=False,
+            output_format="txt",
+        )
+        or ""
+    )
+    links = _extract_links(text, final_url)
+    cleaned_text = _clean_search_text(body_text)
+    truncated = len(cleaned_text) > limit
 
     return {
         "url": safe_url,
         "final_url": final_url,
         "content_type": content_type,
         "title": title,
-        "text": body_text[:limit],
+        "text": cleaned_text[:limit],
         "links": links[:20],
         "truncated": truncated,
     }
@@ -873,232 +976,14 @@ def calculate_expression(expression: str) -> dict[str, Any]:
     return {"expression": normalized_expression, "result": value}
 
 
-def _read_search_response(
-    request: Request,
-    timeout: int = 10,
-    max_bytes: int | None = None,
-    attempts: int = 3,
-) -> bytes:
-    last_error: Exception | None = None
-    for _ in range(attempts):
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                if max_bytes is None:
-                    return response.read()
-                return response.read(max_bytes)
-        except HTTPError:
-            raise
-        except (URLError, TimeoutError, OSError) as exc:
-            last_error = exc
-
-    if last_error is not None:
-        raise last_error
-    raise ToolError("搜索请求失败。")
-
-
-def _search_bing(query: str, limit: int) -> list[dict[str, str]]:
-    url = f"https://www.bing.com/search?cc=us&q={quote_plus(query)}&format=rss"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
-        },
-    )
-
+def _load_serpapi_settings() -> SerpApiSettings:
     try:
-        payload = _read_search_response(request)
-    except HTTPError as exc:
-        raise ToolError(f"Bing 搜索失败：HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ToolError(f"Bing 搜索失败：{exc.reason}") from exc
-    except OSError as exc:
-        raise ToolError(f"Bing 搜索失败：{exc}") from exc
-    except TimeoutError as exc:
-        raise ToolError("Bing 搜索超时。") from exc
-
-    try:
-        root = ElementTree.fromstring(payload)
-    except ElementTree.ParseError as exc:
-        raise ToolError("Bing 返回了无法解析的结果。") from exc
-
-    results = []
-    for item in root.findall("./channel/item")[:limit]:
-        title = _clean_search_text(item.findtext("title"))
-        link = (item.findtext("link") or "").strip()
-        snippet = _clean_search_text(item.findtext("description"))
-
-        if not title and not link:
-            continue
-
-        results.append(
-            {
-                "title": title,
-                "url": link,
-                "snippet": snippet,
-                "source": "bing",
-            }
-        )
-
-    return results
-
-
-def _search_baidu(query: str, limit: int) -> list[dict[str, str]]:
-    url = f"https://www.baidu.com/s?wd={quote_plus(query)}&rn={limit}"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-        },
-    )
-
-    try:
-        html_payload = _read_search_response(request, max_bytes=_MAX_WEB_BYTES)
-    except HTTPError as exc:
-        raise ToolError(f"Baidu 搜索失败：HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ToolError(f"Baidu 搜索失败：{exc.reason}") from exc
-    except OSError as exc:
-        raise ToolError(f"Baidu 搜索失败：{exc}") from exc
-    except TimeoutError as exc:
-        raise ToolError("Baidu 搜索超时。") from exc
-
-    page = html_payload.decode("utf-8", errors="replace")
-    if "百度安全验证" in page or "网络不给力" in page:
-        raise ToolError("Baidu 返回了安全验证或临时不可用页面。")
-
-    results: list[dict[str, str]] = []
-    blocks = re.split(r'<div[^>]+class="[^"]*\bresult\b[^"]*"', page, flags=re.IGNORECASE)
-
-    for block in blocks[1:]:
-        link_match = re.search(
-            r'<h3[^>]*>.*?<a[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?</h3>',
-            block,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not link_match:
-            continue
-
-        snippet_match = re.search(
-            r'<div[^>]+class="[^"]*(?:c-abstract|content-right|result-op)[^"]*"[^>]*>'
-            r"(?P<snippet>.*?)</div>",
-            block,
-            re.DOTALL | re.IGNORECASE,
-        )
-        result_url = html.unescape(link_match.group("url"))
-        if result_url.startswith("/"):
-            result_url = urljoin("https://www.baidu.com", result_url)
-        if "baidu.com/link" in result_url:
-            result_url = _resolve_search_redirect(result_url)
-
-        title = _clean_search_text(link_match.group("title"))
-        snippet = _clean_search_text(snippet_match.group("snippet")) if snippet_match else ""
-        if title and result_url:
-            results.append(
-                {
-                    "title": title,
-                    "url": result_url,
-                    "snippet": snippet,
-                    "source": "baidu",
-                }
-            )
-        if len(results) >= limit:
-            break
-
-    return results
-
-
-def _search_google(query: str, limit: int) -> list[dict[str, str]]:
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num={limit}&hl=zh-CN"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "Chrome/121.0 Safari/537.36 MiniClaw/0.2"
-            ),
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-        },
-    )
-
-    try:
-        html_payload = _read_search_response(request, max_bytes=_MAX_WEB_BYTES)
-    except HTTPError as exc:
-        raise ToolError(f"Google 搜索失败：HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ToolError(f"Google 搜索失败：{exc.reason}") from exc
-    except OSError as exc:
-        raise ToolError(f"Google 搜索失败：{exc}") from exc
-    except TimeoutError as exc:
-        raise ToolError("Google 搜索超时。") from exc
-
-    page = html_payload.decode("utf-8", errors="replace")
-    results: list[dict[str, str]] = []
-
-    for match in re.finditer(
-        r'<a[^>]+href="(?P<href>/url\?q=[^"]+|https?://[^"]+)"[^>]*>.*?'
-        r"<h3[^>]*>(?P<title>.*?)</h3>",
-        page,
-        re.DOTALL | re.IGNORECASE,
-    ):
-        result_url = _decode_google_url(html.unescape(match.group("href")))
-        if not result_url or "google.com" in (urlparse(result_url).hostname or ""):
-            continue
-        title = _clean_search_text(match.group("title"))
-        if not title:
-            continue
-
-        snippet = _google_snippet_after(page, match.end())
-        results.append(
-            {
-                "title": title,
-                "url": result_url,
-                "snippet": snippet,
-                "source": "google",
-            }
-        )
-        if len(results) >= limit:
-            break
-
-    return results
-
-
-def _decode_google_url(href: str) -> str:
-    if href.startswith("/url?"):
-        params = parse_qs(urlparse(href).query)
-        return unquote(params.get("q", [""])[0])
-    return href
-
-
-def _google_snippet_after(page: str, start_index: int) -> str:
-    window = page[start_index : start_index + 1800]
-    candidates = re.findall(
-        r'<div[^>]+(?:data-sncf|class="[^"]*(?:VwiC3b|IsZvec|GI74Re)[^"]*")[^>]*>'
-        r"(?P<snippet>.*?)</div>",
-        window,
-        re.DOTALL | re.IGNORECASE,
-    )
-    for candidate in candidates:
-        snippet = _clean_search_text(candidate)
-        if snippet:
-            return snippet[:500]
-    return ""
-
-
-def _resolve_search_redirect(url: str) -> str:
-    try:
-        _validate_public_url(url)
-        request = Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "*/*"})
-        opener = build_opener(_PublicRedirectHandler)
-        with opener.open(request, timeout=5) as response:
-            final_url = response.geturl()
-    except (HTTPError, URLError, TimeoutError, ToolError):
-        return url
-
-    return final_url or url
+        return SerpApiSettings()
+    except ValidationError as exc:
+        raise ToolError(
+            "请先设置 SERPAPI_KEY。你可以在项目根目录 .env 中写入："
+            "SERPAPI_KEY=你的 key"
+        ) from exc
 
 
 def _dedupe_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1168,10 +1053,7 @@ def _guess_encoding(content_type: str) -> str:
     return "utf-8"
 
 
-def _extract_web_text(page: str, base_url: str) -> tuple[str, str, list[dict[str, str]]]:
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", page, re.DOTALL | re.IGNORECASE)
-    title = _clean_search_text(title_match.group(1)) if title_match else ""
-
+def _extract_links(page: str, base_url: str) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
     for match in re.finditer(
         r'<a\s+[^>]*href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<label>.*?)</a>',
@@ -1186,10 +1068,7 @@ def _extract_web_text(page: str, base_url: str) -> tuple[str, str, list[dict[str
         if len(links) >= 20:
             break
 
-    text = re.sub(r"<(script|style|noscript|svg|canvas)[^>]*>.*?</\1>", " ", page, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
-    text = _clean_search_text(text)
-    return title, text, links
+    return links
 
 
 def _clamp_int(value: int, minimum: int, maximum: int, default: int) -> int:
@@ -1207,20 +1086,6 @@ _MATH_FUNCTIONS: dict[str, Callable[..., Any]] = {
 }
 _MATH_FUNCTIONS.update({"abs": abs, "round": round})
 _MATH_CONSTANTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
-
-
-class _PublicRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        req: Any,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> Request | None:
-        _validate_public_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _eval_math_node(node: ast.AST) -> int | float:
@@ -1448,3 +1313,40 @@ def _strict_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     strict["additionalProperties"] = False
     strict["required"] = list(properties)
     return strict
+
+
+def _fetch_public_payload(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    max_bytes: int | None = None,
+) -> tuple[str, str, bytes]:
+    current_url = url
+    redirect_count = 0
+
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        while True:
+            _validate_public_url(current_url)
+            with client.stream("GET", current_url, headers=headers) as response:
+                response.raise_for_status()
+
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ToolError("重定向响应缺少 location。")
+                    current_url = urljoin(str(response.url), location)
+                    redirect_count += 1
+                    if redirect_count > 5:
+                        raise ToolError("重定向次数过多。")
+                    continue
+
+                content_type = response.headers.get("Content-Type", "")
+                limit = _MAX_WEB_BYTES if max_bytes is None else max_bytes
+                payload = bytearray()
+                for chunk in response.iter_bytes():
+                    payload.extend(chunk)
+                    if len(payload) > limit:
+                        raise ToolError("响应内容过大。")
+                final_url = str(response.url)
+                _validate_public_url(final_url)
+                return final_url, content_type, bytes(payload)

@@ -2,35 +2,23 @@ from __future__ import annotations
 
 import json
 
-from .agent import MiniClawAgent
-from .history import clear_history, load_history
-from .llm import ConfigError, DeepSeekClient
-from .tools import create_default_registry
-
-
-MODELS = ("deepseek-chat", "deepseek-reasoner")
+from .runtime import RuntimeError, runtime
 
 
 def main() -> None:
     print("MiniClaw - Python 智能体作业 2")
-    print("输入 /quit 退出，输入 /model 查看或切换模型，输入 /clear 清空历史。\n")
+    print("输入 /quit 退出，输入 /model 查看或切换模型，输入 /clear 清空历史。")
+    print("Web 模式请使用：conda run -n MiniClaw uvicorn miniclaw.app:app --reload\n")
 
     try:
-        client = DeepSeekClient.from_env()
-    except ConfigError as exc:
+        state = runtime.get_state()
+    except RuntimeError as exc:
         print(f"配置错误：{exc}")
         return
 
-    history = load_history()
-    if history:
-        agent = MiniClawAgent(
-            client=client,
-            tools=create_default_registry(client=client),
-            messages=history,
-        )
-        print(f"已加载历史对话：{len(history)} 条消息。\n")
-    else:
-        agent = MiniClawAgent(client=client, tools=create_default_registry(client=client))
+    agent = state.agent
+    if len(agent.messages) > 1:
+        print(f"已加载历史对话：{len(agent.messages) - 1} 条消息。\n")
 
     while True:
         try:
@@ -45,12 +33,12 @@ def main() -> None:
             print("再见。")
             return
         if user_input == "/clear":
-            agent.reset_messages()
-            clear_history()
+            runtime.reset()
+            agent = runtime.get_state().agent
             print("已清空对话历史。\n")
             continue
         if user_input == "/model" or user_input.startswith("/model "):
-            _handle_model_command(client, user_input)
+            _handle_model_command(user_input)
             continue
 
         printed_reasoning = False
@@ -89,21 +77,24 @@ def main() -> None:
         print("\n")
 
 
-def _handle_model_command(client: DeepSeekClient, command: str) -> None:
+def _handle_model_command(command: str) -> None:
     parts = command.split()
     if len(parts) == 1:
-        print(f"当前模型：{client.model}")
-        print(f"可选模型：{', '.join(MODELS)}\n")
+        model_info = runtime.get_model_info()
+        print(f"当前模型：{model_info['current']}")
+        print(f"可选模型：{', '.join(model_info['models'])}\n")
         return
 
     model = parts[1]
-    if model not in MODELS:
+    try:
+        runtime.set_model(model)
+    except RuntimeError:
+        model_info = runtime.get_model_info()
         print(f"未知模型：{model}")
-        print(f"可选模型：{', '.join(MODELS)}\n")
+        print(f"可选模型：{', '.join(model_info['models'])}\n")
         return
 
-    client.model = model
-    print(f"已切换模型：{client.model}\n")
+    print(f"已切换模型：{runtime.get_state().client.model}\n")
 
 
 def _print_trace(event: dict) -> None:
